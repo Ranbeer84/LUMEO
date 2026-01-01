@@ -1,70 +1,78 @@
-⸻
+# Lumeo - AI-Powered Photo Memory System
 
-Lumeo — AI-Powered Photo Memory System
+> Transforming photos into conversational memories through multi-modal AI
+> 
 
-Transforming personal photos into conversational memories using multi-modal AI
+## 🎯 Vision
 
-⸻
+Lumeo is an **AI-powered conversational photo memory system** that understands your photos the way you remember them - through natural language, emotions, and context. Instead of organizing photos into folders, Lumeo lets you *talk* to your photo collection.
 
-Vision
+**Ask naturally:**
 
-Lumeo is an AI-powered conversational photo memory system that understands photos the way humans remember them — through language, emotions, people, and context, not folders.
+- "Show me happy moments from last summer"
+- "When did I meet Abhigyan at the beach?"
+- "Photos where I'm wearing a black t-shirt"
+- "My most positive memories with family"
 
-Instead of browsing directories, users talk to their photo collection.
+**Get intelligent responses:**
 
-Ask naturally:
-	•	“Show me happy moments from last summer”
-	•	“When did I meet Abhigyan at the beach?”
-	•	“Photos where I’m wearing a black t-shirt”
+- Semantic understanding beyond keywords
+- Emotion and mood analysis
+- Relationship detection and insights
+- Timeline of memories with context
 
-Lumeo responds with:
-	•	Semantic understanding beyond keywords
-	•	Emotion and mood awareness
-	•	Relationship and timeline-based insights
+---
 
-⸻
+## 🚀 Current Status: Phase 0 → Multi-Modal RAG Transformation
 
-Project Status
+### ✅ What's Working Now (v1.0 - Photo Organizer)
 
-Current Phase: Phase 0 → Multi-Modal RAG Transformation
-Stable Baseline: v1.0-photo-organizer
+- Face detection and recognition
+- Automatic person clustering (DBSCAN)
+- Photo organization by person
+- Web interface (React + Flask)
+- SQLite database backend
 
-What’s Working Now (v1.0)
-	•	Face detection and recognition
-	•	Automatic person clustering (DBSCAN)
-	•	Photo organization by person
-	•	React + Flask web application
-	•	SQLite backend
+### 🎯 Transformation Roadmap
 
-⸻
+This project is evolving from a simple photo organizer into a sophisticated AI memory system:
 
-Transformation Roadmap
+**Phase 1:** Database Evolution (SQLite → PostgreSQL + pgvector)
 
-Lumeo is evolving from a photo organizer into a conversational AI memory system:
-	1.	Database Evolution — PostgreSQL + pgvector
-	2.	Vision Intelligence — emotions, objects, scenes, CLIP
-	3.	Retrieval System — vector + hybrid search
-	4.	Generation Layer — local LLM (Ollama, Llama 3.3)
-	5.	Conversational Memory — context-aware chat
-	6.	Frontend Transformation — gallery → conversational UI
-	7.	Insights & Analytics
-	8.	Deployment & Documentation
+**Phase 2:** Vision Intelligence (Faces → Emotions + Objects + Scenes + CLIP)
 
-See VISION.md for the detailed plan.
+**Phase 3:** Retrieval System (Vector search + Hybrid queries)
 
-⸻
+**Phase 4:** Generation Layer (Local LLM with Ollama + Llama 3.3)
 
-Architecture
+**Phase 5:** Conversational Memory (Chat interface with context)
 
-Current Stack (v1.0)
+**Phase 6:** Frontend Transformation (Gallery → Conversational UI)
 
-Frontend:  React (Vite-based)
+**Phase 7:** Intelligence & Polish (Insights, relationships, analytics)
+
+**Phase 8:** Deployment & Documentation
+
+> See VISION.md for the complete transformation plan
+> 
+
+---
+
+## 🏗️ Architecture
+
+### Current Stack (v1.0)
+
+```
+Frontend:  React + Vite + Lucide Icons
 Backend:   Flask + face_recognition + scikit-learn
 Database:  SQLite
 Storage:   Local filesystem
 
-Target Stack
+```
 
+### Target Stack (After Transformation)
+
+```
 Frontend:  React + Streaming Chat Interface
 Backend:   Flask + Multi-Modal AI Pipeline
 Database:  PostgreSQL + pgvector for semantic search
@@ -72,79 +80,248 @@ Vision AI: face_recognition + DeepFace + YOLOv8 + CLIP
 LLM:       Ollama (Llama 3.3) - Local LLM
 RAG:       Hybrid retrieval (semantic + filters)
 
+```
 
-⸻
+---
 
-Setup (v1.0)
+## 🛠️ Current Setup (v1.0)
 
-Prerequisites
-	•	Python 3.11+
-	•	Node.js 18+
-	•	Git
+### Prerequisites
 
-Run Locally
+- Python 3.11+
+- Node.js 18+
+- 8GB+ RAM
+- Git
 
-Backend
+### Installation
 
+**1. Clone the repository**
+
+```bash
+git clone <your-repo-url>
+cd lumeo
+
+```
+
+**2. Backend Setup**
+
+```bash
 cd backend
 python -m venv venv
-source venv/bin/activate
+source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 python app.py
 
-Backend → http://localhost:5002
+```
 
-Frontend
+Backend runs on `http://localhost:5002`
 
+**3. Frontend Setup**
+
+```bash
 cd frontend
 npm install
 npm run dev
 
-Frontend → http://localhost:3002
+```
 
-⸻
+Frontend runs on `http://localhost:3002`
 
-Planned Capabilities
-	•	Emotion, object, and scene detection
-	•	Semantic image understanding with CLIP
-	•	Natural language photo queries
-	•	Context-aware conversational memory
-	•	Intelligent insights (relationships, trends, events)
+**4. Upload & Organize Photos**
 
-⸻
+- Open browser to http://localhost:3002
+- Upload multiple photos
+- Click "Start Face Detection"
+- Label people in clusters
+- Click "Organize Folders" to create organized copies
 
-Safety & Rollback
 
-A stable checkpoint exists at:
+## 🧪 Current Features (v1.0)
 
-v1.0-photo-organizer
+### Photo Upload & Processing
 
-Rollback instantly
+- Drag-and-drop or file selection
+- Batch upload support
+- Progress tracking
 
-./scripts/rollback.sh
+### Face Recognition
 
-Compare changes
+- Automatic face detection in photos
+- Face encoding using dlib's ResNet model
+- DBSCAN clustering to group same people
+- Quality-based thumbnail selection
 
+### Organization
+
+- Label people in clusters
+- Automatic folder creation per person
+- Photos copied to respective person folders
+- Preserves original files
+
+### Web Interface
+
+- Modern glassmorphic design
+- Responsive layout (mobile-friendly)
+- Step-by-step workflow
+- Cluster photo viewer with navigation
+
+---
+
+## 🔮 Upcoming Features (Transformation)
+
+### Multi-Modal Understanding
+
+- **Emotion Detection**: Recognize happiness, sadness, surprise, etc.
+- **Object Recognition**: Detect clothing, items, colors
+- **Scene Classification**: Indoor/outdoor, beach/office, etc.
+- **CLIP Embeddings**: Semantic understanding of image content
+
+### Conversational Interface
+
+- **Natural Language Queries**: "Show me beach photos from last summer"
+- **Context-Aware Chat**: Follow-up questions work naturally
+- **Streaming Responses**: Real-time AI responses word-by-word
+- **Photo Inline Display**: Photos appear in conversation flow
+
+### Intelligent Insights
+
+- "You appear happiest at the beach"
+- "Your most frequent companion is [person]"
+- Emotional trends over time
+- Event detection (birthdays, vacations)
+
+### Advanced Retrieval
+
+- Semantic search (meaning, not just keywords)
+- Hybrid queries (concepts + filters + people)
+- Similarity search ("photos like this one")
+- Multi-criteria ranking
+
+---
+
+## 🎓 Technical Highlights (For Thesis/Interviews)
+
+### Machine Learning Components
+
+1. **Face Recognition**: dlib CNN face encoder (128-d embeddings)
+2. **Clustering**: DBSCAN with adaptive parameters
+3. **Future**: DeepFace, YOLOv8, CLIP, Llama 3.3
+
+### System Design
+
+- **Modular Architecture**: Separate services for each AI component
+- **Pipeline Orchestration**: Coordinated multi-model processing
+- **RAG Pattern**: Retrieval-Augmented Generation for grounded responses
+- **Vector Search**: pgvector for semantic similarity
+
+### Key Decisions
+
+- **Local LLM**: Privacy + Cost + Learning (vs OpenAI API)
+- **PostgreSQL**: Production-ready + pgvector support
+- **DBSCAN**: Handles unknown cluster count + outliers
+- **Modular Services**: Easy to test, swap, and scale
+
+---
+
+## 🔒 Safety & Rollback (v1.0 Checkpoint)
+
+A safety checkpoint has been created at tag `v1.0-photo-organizer`.
+
+**To rollback to v1.0:**
+
+```bash
+./rollback-script.sh
+# or manually:
+git checkout v1.0-photo-organizer
+
+```
+
+**To see transformation progress:**
+
+```bash
 git diff v1.0-photo-organizer ai-transformation
 
+```
 
-⸻
+**To list all tags:**
 
-Technical Highlights
-	•	Face Recognition: dlib ResNet (128-D embeddings)
-	•	Clustering: DBSCAN (no fixed cluster count)
-	•	Architecture: Modular, pipeline-based AI system
-	•	RAG Pattern: Retrieval-augmented, grounded responses
-	•	Local LLM: Privacy-first, cost-efficient design
+```bash
+git tag -l
 
-⸻
+```
 
-📄 License
+---
 
-MIT License
+## 📊 Current Database Schema (v1.0)
 
-⸻
+```sql
+photos
+  - photo_id (PK)
+  - filename
+  - path
+  - upload_date
 
-From simple photo organization to conversational AI memory — this is Lumeo. 🚀
+clusters (people)
+  - cluster_id (PK)
+  - name (user-assigned label)
+  - face_count
+  - thumbnail
+  - created_at
 
-⸻
+face_embeddings
+  - embedding_id (PK)
+  - photo_id (FK)
+  - cluster_id (FK)
+  - embedding (blob: 128-d vector)
+  - face_location (JSON)
+
+photo_clusters (junction table)
+  - photo_id (FK)
+  - cluster_id (FK)
+  - (handles many-to-many: one photo can have multiple people)
+
+```
+
+> Note: Schema will be dramatically enhanced during transformation
+> 
+
+---
+
+## 🤝 Contributing
+
+This project is currently in active transformation. If you'd like to:
+
+- Report bugs in v1.0
+- Suggest features for the AI system
+- Contribute to the transformation
+
+Please open an issue or PR!
+
+---
+
+## 📄 License
+
+MIT License - Feel free to use and modify
+
+---
+
+## 🙏 Acknowledgments
+
+Built with:
+
+- [face_recognition](https://github.com/ageitgey/face_recognition) by Adam Geitgey
+- [React](https://react.dev/) + [Vite](https://vitejs.dev/)
+- [Flask](https://flask.palletsprojects.com/)
+- [lucide-react](https://lucide.dev/) for beautiful icons
+
+Transformation inspired by modern RAG systems and conversational AI.
+
+---
+
+## 📞 Contact
+
+Questions about the transformation or technical approach? Open an issue!
+
+---
+
+**From simple photo organizer to conversational AI memory system - Join the journey! 🚀**
