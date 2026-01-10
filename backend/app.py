@@ -1,23 +1,51 @@
 """
-Photo Organizer Backend - Flask API with Face Recognition (FIXED)
-Fixed clustering algorithm with proper face-to-person mapping
+Lumeo Photo Organizer Backend - Complete Phase 2
+Uses PostgreSQL + SQLAlchemy + Vision Intelligence Pipeline
+
+Features:
+- Face recognition with quality assessment
+- Emotion detection
+- Object detection with YOLO
+- Scene classification
+- CLIP embeddings
+- Metadata extraction
 """
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-import face_recognition
-import numpy as np
-from sklearn.cluster import DBSCAN
-from PIL import Image
 import os
 import shutil
 import json
-from datetime import datetime
-import sqlite3
 import time
-from pathlib import Path
-import cv2
+import numpy as np
+from datetime import datetime
+import logging
 
+# Import SQLAlchemy models (Phase 1)
+from models import (
+    Session, Photo, Cluster, FaceEmbedding, 
+    DetectedObject, PhotoCluster
+)
+
+# Import vision services (Phase 2)
+try:
+    from services.pipeline_service import get_pipeline
+    from services.face_service import get_face_service
+    from services.clip_service import get_clip_service
+    SERVICES_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️  WARNING: Services not available: {e}")
+    print("    Make sure backend/services/ directory exists with all service modules")
+    SERVICES_AVAILABLE = False
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Initialize Flask app
 app = Flask(__name__)
 CORS(app)
 
@@ -25,238 +53,313 @@ CORS(app)
 UPLOAD_FOLDER = 'uploads'
 ORGANIZED_FOLDER = 'organized_photos'
 THUMBNAILS_FOLDER = 'thumbnails'
-DB_PATH = 'photo_organizer.db'
 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(ORGANIZED_FOLDER, exist_ok=True)
-os.makedirs(THUMBNAILS_FOLDER, exist_ok=True)
+# Create folders
+for folder in [UPLOAD_FOLDER, ORGANIZED_FOLDER, THUMBNAILS_FOLDER]:
+    os.makedirs(folder, exist_ok=True)
 
-# Serve uploaded files
+logger.info("✓ Lumeo backend initialized")
+logger.info(f"✓ Services available: {SERVICES_AVAILABLE}")
+
+# ============================================================================
+# STATIC FILE ROUTES
+# ============================================================================
+
 @app.route('/uploads/<path:filename>')
 def serve_upload(filename):
+    """Serve uploaded photos"""
     return send_from_directory(UPLOAD_FOLDER, filename)
 
 @app.route('/thumbnails/<path:filename>')
 def serve_thumbnail(filename):
+    """Serve face thumbnails"""
     return send_from_directory(THUMBNAILS_FOLDER, filename)
 
-# Database setup
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    # Photos table - removed cluster_id since photos can have multiple people
-    c.execute('''CREATE TABLE IF NOT EXISTS photos
-                 (photo_id TEXT PRIMARY KEY,
-                  filename TEXT,
-                  path TEXT,
-                  upload_date REAL)''')
-    
-    # Clusters/People table
-    c.execute('''CREATE TABLE IF NOT EXISTS clusters
-                 (cluster_id TEXT PRIMARY KEY, 
-                  name TEXT, 
-                  face_count INTEGER,
-                  thumbnail TEXT,
-                  created_at REAL)''')
-    
-    # Face embeddings - links faces to both photos and clusters
-    c.execute('''CREATE TABLE IF NOT EXISTS face_embeddings
-                 (embedding_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  photo_id TEXT,
-                  cluster_id TEXT,
-                  embedding BLOB,
-                  face_location TEXT,
-                  FOREIGN KEY (photo_id) REFERENCES photos(photo_id),
-                  FOREIGN KEY (cluster_id) REFERENCES clusters(cluster_id))''')
-    
-    # Junction table for many-to-many relationship between photos and clusters
-    c.execute('''CREATE TABLE IF NOT EXISTS photo_clusters
-                 (photo_id TEXT,
-                  cluster_id TEXT,
-                  PRIMARY KEY (photo_id, cluster_id),
-                  FOREIGN KEY (photo_id) REFERENCES photos(photo_id),
-                  FOREIGN KEY (cluster_id) REFERENCES clusters(cluster_id))''')
-    
-    conn.commit()
-    conn.close()
+# ============================================================================
+# API ROUTES
+# ============================================================================
 
-init_db()
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    session = Session()
+    try:
+        photo_count = session.query(Photo).count()
+        session.close()
+        
+        return jsonify({
+            'status': 'healthy',
+            'database': 'connected',
+            'services': SERVICES_AVAILABLE,
+            'photos': photo_count
+        })
+    except Exception as e:
+        session.close()
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e)
+        }), 500
 
-class FaceRecognitionService:
-    """Handle all face recognition operations"""
+@app.route('/api/pipeline-status', methods=['GET'])
+def pipeline_status():
+    """Check if AI services are ready"""
+    if not SERVICES_AVAILABLE:
+        return jsonify({
+            'ready': False,
+            'error': 'Services not imported'
+        }), 500
     
-    def __init__(self):
-        self.face_encodings = []
-        self.face_locations = []
-        self.photo_ids = []
+    try:
+        pipeline = get_pipeline()
+        stats = pipeline.get_processing_stats()
         
-    def detect_faces(self, image_path):
-        """Detect faces in an image and return encodings"""
-        try:
-            # Load image
-            image = face_recognition.load_image_file(image_path)
-            
-            # Find all face locations and encodings
-            # Using 'hog' for speed, change to 'cnn' for better accuracy
-            face_locations = face_recognition.face_locations(image, model="hog")
-            face_encodings = face_recognition.face_encodings(image, face_locations)
-            
-            return face_encodings, face_locations
-        except Exception as e:
-            print(f"Error detecting faces in {image_path}: {str(e)}")
-            return [], []
-    
-    def cluster_faces(self, encodings, min_samples=1, eps=0.6):
-        """
-        Cluster face encodings using DBSCAN
-        
-        FIXED: Better parameters for face clustering
-        - min_samples=1: Each face can form a cluster (good for single photos of a person)
-        - eps=0.6: Distance threshold (0.6 is standard for face_recognition library)
-        """
-        if len(encodings) == 0:
-            return []
-        
-        # Convert to numpy array
-        encodings_array = np.array(encodings)
-        
-        # Use DBSCAN for clustering
-        # eps=0.6 is the recommended threshold for face_recognition encodings
-        clustering = DBSCAN(eps=eps, min_samples=min_samples, metric='euclidean')
-        labels = clustering.fit_predict(encodings_array)
-        
-        return labels
-    
-    def extract_face_thumbnail(self, image_path, face_location, output_path):
-        """Extract and save face thumbnail"""
-        try:
-            image = cv2.imread(image_path)
-            if image is None:
-                return False
-                
-            top, right, bottom, left = face_location
-            
-            # Add padding
-            padding = 40
-            height, width = image.shape[:2]
-            top = max(0, top - padding)
-            left = max(0, left - padding)
-            bottom = min(height, bottom + padding)
-            right = min(width, right + padding)
-            
-            face_image = image[top:bottom, left:right]
-            
-            # Resize to consistent thumbnail size
-            face_image = cv2.resize(face_image, (200, 200))
-            cv2.imwrite(output_path, face_image)
-            return True
-        except Exception as e:
-            print(f"Error extracting face: {str(e)}")
-            return False
-
-face_service = FaceRecognitionService()
+        return jsonify({
+            'ready': all(stats.values()),
+            'services': stats
+        })
+    except Exception as e:
+        return jsonify({
+            'ready': False,
+            'error': str(e)
+        }), 500
 
 @app.route('/api/upload', methods=['POST'])
 def upload_photos():
-    """Upload photos endpoint"""
+    """
+    Upload photos to the system
+    
+    Request: multipart/form-data with 'photos' field
+    Response: List of uploaded photo info
+    """
     if 'photos' not in request.files:
         return jsonify({'error': 'No photos uploaded'}), 400
     
     files = request.files.getlist('photos')
+    if not files:
+        return jsonify({'error': 'No photos selected'}), 400
+    
     uploaded_photos = []
+    session = Session()
     
-    for file in files:
-        if file.filename:
-            # Save file
-            timestamp = datetime.now().timestamp()
-            filename = f"{timestamp}_{file.filename}"
-            filepath = os.path.join(UPLOAD_FOLDER, filename)
-            file.save(filepath)
-            
-            # Store in database
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            photo_id = f"photo_{timestamp}_{len(uploaded_photos)}"
-            c.execute('''INSERT INTO photos (photo_id, filename, path, upload_date)
-                        VALUES (?, ?, ?, ?)''',
-                     (photo_id, filename, filepath, time.time()))
-            conn.commit()
-            conn.close()
-            
-            uploaded_photos.append({
-                'photo_id': photo_id,
-                'filename': filename,
-                'path': filepath
-            })
-    
-    return jsonify({
-        'success': True,
-        'photos_count': len(uploaded_photos),
-        'photos': uploaded_photos
-    })
+    try:
+        for file in files:
+            if file.filename:
+                # Generate unique filename
+                timestamp = datetime.now().timestamp()
+                filename = f"{timestamp}_{file.filename}"
+                filepath = os.path.join(UPLOAD_FOLDER, filename)
+                
+                # Save file
+                file.save(filepath)
+                
+                # Create database record
+                photo_id = f"photo_{timestamp}_{len(uploaded_photos)}"
+                photo = Photo(
+                    photo_id=photo_id,
+                    filename=filename,
+                    path=filepath,
+                    upload_date=time.time()
+                )
+                session.add(photo)
+                
+                uploaded_photos.append({
+                    'photo_id': photo_id,
+                    'filename': filename,
+                    'path': filepath
+                })
+                
+                logger.info(f"✓ Uploaded: {filename}")
+        
+        session.commit()
+        logger.info(f"✓ Uploaded {len(uploaded_photos)} photos")
+        
+        return jsonify({
+            'success': True,
+            'photos_count': len(uploaded_photos),
+            'photos': uploaded_photos
+        })
+        
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Upload error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
 
 @app.route('/api/process', methods=['POST'])
 def process_photos():
     """
-    FIXED: Process photos with proper face-to-cluster mapping
-    Each face gets its own cluster assignment, photos can belong to multiple clusters
+    Process photos through vision pipeline and face clustering
+    
+    Phase 2 Enhanced:
+    - Face detection with quality scores
+    - Emotion detection per face
+    - Object detection with YOLO
+    - Scene classification
+    - CLIP embeddings
+    - Metadata extraction
+    - Face clustering with emotions
     """
+    if not SERVICES_AVAILABLE:
+        return jsonify({
+            'error': 'Vision services not available',
+            'message': 'Ensure services/ directory exists with all modules'
+        }), 500
+    
     try:
-        # Get all unprocessed photos
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
+        pipeline = get_pipeline()
+        face_service = get_face_service()
+        session = Session()
         
-        # Get photos that haven't been processed yet
-        c.execute('''SELECT DISTINCT p.photo_id, p.path 
-                    FROM photos p 
-                    LEFT JOIN face_embeddings fe ON p.photo_id = fe.photo_id 
-                    WHERE fe.photo_id IS NULL''')
-        photos = c.fetchall()
+        # Check if services are ready
+        stats = pipeline.get_processing_stats()
+        if not all(stats.values()):
+            return jsonify({
+                'error': 'Some services not ready',
+                'service_status': stats
+            }), 500
+        
+        # Get unprocessed photos (those without CLIP embeddings)
+        photos = session.query(Photo).filter(Photo.clip_embedding == None).all()
         
         if not photos:
-            conn.close()
-            return jsonify({'message': 'No unprocessed photos found'}), 200
+            session.close()
+            return jsonify({
+                'message': 'No unprocessed photos found',
+                'clusters': []
+            }), 200
         
-        # Data structures to track all faces
-        all_encodings = []
-        all_face_data = []  # Store photo_id, path, and location for each face
+        logger.info(f"========================================")
+        logger.info(f"Processing {len(photos)} photos with vision pipeline")
+        logger.info(f"========================================")
         
-        # Process each photo and extract all faces
-        print(f"Processing {len(photos)} photos...")
-        for photo_id, path in photos:
-            if not os.path.exists(path):
-                print(f"Photo not found: {path}")
-                continue
-                
-            encodings, locations = face_service.detect_faces(path)
-            print(f"Found {len(encodings)} faces in {path}")
+        all_faces_data = []  # For clustering
+        processed_count = 0
+        
+        # =====================================================================
+        # STEP 1: VISION PIPELINE - Analyze each photo
+        # =====================================================================
+        
+        for idx, photo in enumerate(photos):
+            logger.info(f"\n--- Photo {idx + 1}/{len(photos)}: {photo.filename} ---")
             
-            for encoding, location in zip(encodings, locations):
-                all_encodings.append(encoding)
-                all_face_data.append({
-                    'photo_id': photo_id,
-                    'path': path,
-                    'location': location,
-                    'encoding': encoding
-                })
+            if not os.path.exists(photo.path):
+                logger.warning(f"File not found: {photo.path}")
+                continue
+            
+            # Run full vision pipeline
+            result = pipeline.process_photo(photo.path, photo.photo_id)
+            
+            if not result.get('analysis_complete'):
+                logger.error(f"Pipeline failed: {result.get('error')}")
+                continue
+            
+            try:
+                # Update photo with vision analysis results
+                
+                # CLIP embedding (for semantic search in Phase 3)
+                if result.get('clip_embedding'):
+                    # Convert list back to numpy array for pgvector
+                    photo.clip_embedding = result['clip_embedding']
+                
+                # Scene classification
+                scene = result.get('scene', {})
+                photo.scene_type = scene.get('scene_type')
+                photo.location_type = scene.get('location')
+                photo.activity = scene.get('activity')
+                
+                # Caption
+                photo.caption = result.get('caption')
+                
+                # Emotion aggregation
+                photo_emotion = result.get('photo_emotion', {})
+                photo.dominant_emotion = photo_emotion.get('dominant_emotion')
+                photo.mood_score = photo_emotion.get('mood_score')
+                
+                # Metadata from EXIF
+                metadata = result.get('metadata', {})
+                if metadata.get('date_taken'):
+                    photo.date_taken = metadata['date_taken']
+                photo.season = metadata.get('season')
+                photo.time_of_day = metadata.get('time_of_day')
+                photo.camera_make = metadata.get('camera_make')
+                photo.camera_model = metadata.get('camera_model')
+                photo.image_quality = metadata.get('quality_score')
+                
+                # GPS coordinates
+                gps = metadata.get('gps')
+                if gps:
+                    photo.gps_latitude = gps.get('latitude')
+                    photo.gps_longitude = gps.get('longitude')
+                
+                # Save detected objects
+                for obj in result.get('objects', []):
+                    detected_obj = DetectedObject(
+                        photo_id=photo.photo_id,
+                        label=obj['label'],
+                        confidence=obj['confidence'],
+                        bbox_x1=obj['bbox']['x1'],
+                        bbox_y1=obj['bbox']['y1'],
+                        bbox_x2=obj['bbox']['x2'],
+                        bbox_y2=obj['bbox']['y2'],
+                        dominant_color_rgb=str(obj.get('dominant_color_rgb', '')),
+                        color_name=obj.get('color_name', '')
+                    )
+                    session.add(detected_obj)
+                
+                # Collect face data for clustering
+                for face_data in result.get('faces', []):
+                    all_faces_data.append({
+                        'photo_id': photo.photo_id,
+                        'photo_path': photo.path,
+                        'encoding': np.array(face_data['encoding']),
+                        'location': face_data['location'],
+                        'quality_score': face_data.get('quality_score', 0.5),
+                        'emotion': face_data.get('emotion', {})
+                    })
+                
+                processed_count += 1
+                logger.info(f"✓ Processed {photo.filename}: {len(result.get('faces', []))} faces, {len(result.get('objects', []))} objects")
+                
+            except Exception as e:
+                logger.error(f"Error saving data for {photo.filename}: {str(e)}")
+                continue
         
-        if len(all_encodings) == 0:
-            conn.close()
-            return jsonify({'error': 'No faces detected in photos'}), 400
+        # Commit photo updates and objects
+        session.commit()
+        logger.info(f"\n✓ Saved vision analysis for {processed_count} photos")
         
-        print(f"Total faces detected: {len(all_encodings)}")
+        # =====================================================================
+        # STEP 2: FACE CLUSTERING
+        # =====================================================================
         
-        # Cluster all faces together
-        labels = face_service.cluster_faces(all_encodings, min_samples=1, eps=0.6)
-        print(f"Clustering result: {len(set(labels))} unique clusters")
+        if len(all_faces_data) == 0:
+            session.close()
+            logger.warning("No faces detected in any photos")
+            return jsonify({
+                'success': True,
+                'processed_photos': processed_count,
+                'total_faces': 0,
+                'clusters': [],
+                'message': 'Photos processed but no faces detected'
+            })
+        
+        logger.info(f"\n========================================")
+        logger.info(f"Clustering {len(all_faces_data)} faces")
+        logger.info(f"========================================")
+        
+        # Extract encodings and quality scores
+        encodings = [face['encoding'] for face in all_faces_data]
+        quality_scores = [face['quality_score'] for face in all_faces_data]
+        
+        # Cluster faces
+        labels = face_service.cluster_faces(encodings, quality_scores, min_samples=1, eps=0.6)
         
         # Organize faces by cluster
         clusters = {}
-        
         for idx, label in enumerate(labels):
-            if label == -1:  # Skip outliers (though with min_samples=1, should be rare)
-                print(f"Outlier face detected at index {idx}")
+            if label == -1:  # Skip noise/outliers
+                logger.debug(f"Outlier face at index {idx}")
                 continue
             
             cluster_id = f"cluster_{label}"
@@ -264,153 +367,207 @@ def process_photos():
             if cluster_id not in clusters:
                 clusters[cluster_id] = {
                     'faces': [],
-                    'photos': set(),  # Track unique photos
-                    'encodings': []
+                    'photos': set()
                 }
             
-            face_data = all_face_data[idx]
-            clusters[cluster_id]['faces'].append(face_data)
-            clusters[cluster_id]['photos'].add(face_data['photo_id'])
-            clusters[cluster_id]['encodings'].append(face_data['encoding'])
+            clusters[cluster_id]['faces'].append(all_faces_data[idx])
+            clusters[cluster_id]['photos'].add(all_faces_data[idx]['photo_id'])
         
-        print(f"Created {len(clusters)} clusters")
+        logger.info(f"✓ Created {len(clusters)} person clusters")
         
         # Save clusters to database
         for cluster_id, data in clusters.items():
-            # Find the most representative face (closest to cluster center)
-            encodings_array = np.array(data['encodings'])
-            cluster_center = np.mean(encodings_array, axis=0)
+            # Find best quality face for thumbnail
+            best_face = max(data['faces'], key=lambda x: x['quality_score'])
             
-            # Calculate distances from each face to the cluster center
-            distances = [np.linalg.norm(enc - cluster_center) for enc in data['encodings']]
+            logger.info(f"Cluster {cluster_id}: {len(data['faces'])} faces, best quality: {best_face['quality_score']:.2f}")
             
-            # Get the face closest to center (most representative)
-            best_face_idx = np.argmin(distances)
-            representative_face = data['faces'][best_face_idx]
-            
-            print(f"{cluster_id}: Selected face {best_face_idx} out of {len(data['faces'])} as thumbnail")
-            
-            # Create thumbnail from most representative face
+            # Create thumbnail from best face
             thumbnail_filename = f"{cluster_id}_thumb.jpg"
             thumbnail_path = os.path.join(THUMBNAILS_FOLDER, thumbnail_filename)
             
             face_service.extract_face_thumbnail(
-                representative_face['path'],
-                representative_face['location'],
+                best_face['photo_path'],
+                best_face['location'],
                 thumbnail_path
             )
             
-            # Insert or update cluster
-            c.execute('''INSERT OR REPLACE INTO clusters 
-                        (cluster_id, name, face_count, thumbnail, created_at)
-                        VALUES (?, ?, ?, ?, ?)''',
-                     (cluster_id, f"Person {cluster_id.split('_')[1]}", 
-                      len(data['faces']), thumbnail_filename, time.time()))
+            # Create or update cluster
+            cluster = session.query(Cluster).filter_by(cluster_id=cluster_id).first()
+            if not cluster:
+                cluster = Cluster(
+                    cluster_id=cluster_id,
+                    name=f"Person {cluster_id.split('_')[1]}",
+                    face_count=len(data['faces']),
+                    thumbnail=thumbnail_filename,
+                    created_at=time.time()
+                )
+                session.add(cluster)
+            else:
+                cluster.face_count = len(data['faces'])
+                cluster.thumbnail = thumbnail_filename
             
-            # Store each face embedding with its photo and cluster
+            # Save face embeddings with emotion and quality
             for face_data in data['faces']:
-                c.execute('''INSERT INTO face_embeddings 
-                            (photo_id, cluster_id, embedding, face_location)
-                            VALUES (?, ?, ?, ?)''',
-                         (face_data['photo_id'], cluster_id, 
-                          face_data['encoding'].tobytes(), 
-                          json.dumps(face_data['location'])))
+                face_embedding = FaceEmbedding(
+                    photo_id=face_data['photo_id'],
+                    cluster_id=cluster_id,
+                    embedding=face_data['encoding'].tobytes(),
+                    face_location=json.dumps(face_data['location']),
+                    emotion=face_data['emotion'].get('dominant_emotion'),
+                    emotion_confidence=face_data['emotion'].get('confidence'),
+                    emotion_valence=face_data['emotion'].get('valence'),
+                    quality_score=face_data['quality_score']
+                )
+                session.add(face_embedding)
                 
                 # Link photo to cluster (many-to-many)
-                c.execute('''INSERT OR IGNORE INTO photo_clusters 
-                            (photo_id, cluster_id)
-                            VALUES (?, ?)''',
-                         (face_data['photo_id'], cluster_id))
+                photo_cluster = PhotoCluster(
+                    photo_id=face_data['photo_id'],
+                    cluster_id=cluster_id
+                )
+                session.add(photo_cluster)
         
-        conn.commit()
+        session.commit()
+        logger.info(f"✓ Saved all clusters and face embeddings")
         
         # Get cluster info for response
-        c.execute('SELECT cluster_id, name, face_count, thumbnail FROM clusters')
-        cluster_info = [{'cluster_id': row[0], 'name': row[1], 
-                        'face_count': row[2], 'thumbnail': row[3]} 
-                       for row in c.fetchall()]
+        clusters_list = session.query(Cluster).all()
+        cluster_info = []
         
-        conn.close()
+        for cluster in clusters_list:
+            # Get photos for this cluster
+            photo_clusters = session.query(PhotoCluster).filter_by(
+                cluster_id=cluster.cluster_id
+            ).all()
+            
+            photos_in_cluster = []
+            for pc in photo_clusters:
+                p = session.query(Photo).filter_by(photo_id=pc.photo_id).first()
+                if p:
+                    photos_in_cluster.append({
+                        'photo_id': p.photo_id,
+                        'filename': p.filename,
+                        'path': p.filename  # Frontend expects filename
+                    })
+            
+            cluster_info.append({
+                'cluster_id': cluster.cluster_id,
+                'name': cluster.name,
+                'face_count': cluster.face_count,
+                'thumbnail': cluster.thumbnail,
+                'photos': photos_in_cluster
+            })
+        
+        session.close()
+        
+        logger.info(f"\n========================================")
+        logger.info(f"✓ Processing complete!")
+        logger.info(f"  - Processed photos: {processed_count}")
+        logger.info(f"  - Total faces: {len(all_faces_data)}")
+        logger.info(f"  - Person clusters: {len(clusters)}")
+        logger.info(f"========================================\n")
         
         return jsonify({
             'success': True,
+            'processed_photos': processed_count,
+            'total_faces': len(all_faces_data),
             'clusters': cluster_info,
-            'total_faces': len(all_encodings),
             'total_clusters': len(clusters)
         })
         
     except Exception as e:
+        logger.error(f"Processing error: {str(e)}")
         import traceback
-        print(traceback.format_exc())
+        logger.error(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/clusters', methods=['GET'])
 def get_clusters():
-    """Get all clusters with their photos"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    """Get all person clusters with their photos"""
+    session = Session()
     
-    c.execute('SELECT cluster_id, name, face_count, thumbnail FROM clusters')
-    clusters = []
-    
-    for row in c.fetchall():
-        cluster_id, name, face_count, thumbnail = row
+    try:
+        clusters = session.query(Cluster).all()
+        cluster_list = []
         
-        # Get photos for this cluster (via junction table)
-        c.execute('''SELECT DISTINCT p.photo_id, p.filename, p.path 
-                    FROM photos p
-                    JOIN photo_clusters pc ON p.photo_id = pc.photo_id
-                    WHERE pc.cluster_id = ?''',
-                 (cluster_id,))
-        photos = [{'photo_id': p[0], 'filename': p[1], 'path': p[1]} 
-                 for p in c.fetchall()]
+        for cluster in clusters:
+            # Get photos for this cluster via junction table
+            photo_clusters = session.query(PhotoCluster).filter_by(
+                cluster_id=cluster.cluster_id
+            ).all()
+            
+            photos = []
+            for pc in photo_clusters:
+                photo = session.query(Photo).filter_by(photo_id=pc.photo_id).first()
+                if photo:
+                    photos.append({
+                        'photo_id': photo.photo_id,
+                        'filename': photo.filename,
+                        'path': photo.filename
+                    })
+            
+            cluster_list.append({
+                'cluster_id': cluster.cluster_id,
+                'name': cluster.name,
+                'face_count': cluster.face_count,
+                'thumbnail': cluster.thumbnail,
+                'photos': photos
+            })
         
-        clusters.append({
-            'cluster_id': cluster_id,
-            'name': name,
-            'face_count': face_count,
-            'photos': photos,
-            'thumbnail': thumbnail
-        })
-    
-    conn.close()
-    return jsonify({'clusters': clusters})
+        session.close()
+        return jsonify({'clusters': cluster_list})
+        
+    except Exception as e:
+        session.close()
+        logger.error(f"Error getting clusters: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/cluster/<cluster_id>/photos', methods=['GET'])
 def get_cluster_photos(cluster_id):
-    """Get all photos for a specific cluster"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    """Get all photos for a specific person/cluster"""
+    session = Session()
     
-    # Get cluster info
-    c.execute('SELECT name, face_count FROM clusters WHERE cluster_id = ?', (cluster_id,))
-    cluster_info = c.fetchone()
-    
-    if not cluster_info:
-        conn.close()
-        return jsonify({'error': 'Cluster not found'}), 404
-    
-    # Get photos via junction table
-    c.execute('''SELECT DISTINCT p.photo_id, p.filename, p.path 
-                FROM photos p
-                JOIN photo_clusters pc ON p.photo_id = pc.photo_id
-                WHERE pc.cluster_id = ?''',
-             (cluster_id,))
-    photos = [{'photo_id': p[0], 'filename': p[1], 'path': p[1]} 
-             for p in c.fetchall()]
-    
-    conn.close()
-    
-    return jsonify({
-        'cluster_id': cluster_id,
-        'name': cluster_info[0],
-        'face_count': cluster_info[1],
-        'photos': photos
-    })
+    try:
+        # Get cluster info
+        cluster = session.query(Cluster).filter_by(cluster_id=cluster_id).first()
+        
+        if not cluster:
+            session.close()
+            return jsonify({'error': 'Cluster not found'}), 404
+        
+        # Get photos via junction table
+        photo_clusters = session.query(PhotoCluster).filter_by(
+            cluster_id=cluster_id
+        ).all()
+        
+        photos = []
+        for pc in photo_clusters:
+            photo = session.query(Photo).filter_by(photo_id=pc.photo_id).first()
+            if photo:
+                photos.append({
+                    'photo_id': photo.photo_id,
+                    'filename': photo.filename,
+                    'path': photo.filename
+                })
+        
+        session.close()
+        
+        return jsonify({
+            'cluster_id': cluster_id,
+            'name': cluster.name,
+            'face_count': cluster.face_count,
+            'photos': photos
+        })
+        
+    except Exception as e:
+        session.close()
+        logger.error(f"Error getting cluster photos: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/cluster/rename', methods=['POST'])
 def rename_cluster():
-    """Rename a cluster"""
+    """Rename a person/cluster"""
     data = request.json
     cluster_id = data.get('cluster_id')
     new_name = data.get('name')
@@ -418,52 +575,62 @@ def rename_cluster():
     if not cluster_id or not new_name:
         return jsonify({'error': 'Missing cluster_id or name'}), 400
     
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('UPDATE clusters SET name = ? WHERE cluster_id = ?',
-             (new_name, cluster_id))
-    conn.commit()
-    conn.close()
+    session = Session()
     
-    return jsonify({'success': True})
+    try:
+        cluster = session.query(Cluster).filter_by(cluster_id=cluster_id).first()
+        
+        if not cluster:
+            session.close()
+            return jsonify({'error': 'Cluster not found'}), 404
+        
+        cluster.name = new_name
+        session.commit()
+        session.close()
+        
+        logger.info(f"✓ Renamed cluster {cluster_id} to '{new_name}'")
+        
+        return jsonify({'success': True})
+        
+    except Exception as e:
+        session.rollback()
+        session.close()
+        logger.error(f"Error renaming cluster: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/organize', methods=['POST'])
 def organize_photos():
     """
-    FIXED: Organize photos into folders by cluster/person
+    Organize photos into folders by person/cluster
     Photos with multiple people will be copied to multiple folders
     """
+    session = Session()
+    
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        
-        c.execute('SELECT cluster_id, name FROM clusters')
-        clusters = c.fetchall()
-        
+        clusters = session.query(Cluster).all()
         organized_count = 0
         
-        for cluster_id, name in clusters:
+        for cluster in clusters:
             # Create folder for this person
-            person_folder = os.path.join(ORGANIZED_FOLDER, name)
+            person_folder = os.path.join(ORGANIZED_FOLDER, cluster.name)
             os.makedirs(person_folder, exist_ok=True)
             
-            # Get photos for this cluster via junction table
-            c.execute('''SELECT DISTINCT p.photo_id, p.path, p.filename 
-                        FROM photos p
-                        JOIN photo_clusters pc ON p.photo_id = pc.photo_id
-                        WHERE pc.cluster_id = ?''',
-                     (cluster_id,))
-            photos = c.fetchall()
+            # Get photos for this cluster
+            photo_clusters = session.query(PhotoCluster).filter_by(
+                cluster_id=cluster.cluster_id
+            ).all()
             
-            # Copy photos to person's folder
-            for photo_id, path, filename in photos:
-                if os.path.exists(path):
-                    dest_path = os.path.join(person_folder, filename)
-                    if not os.path.exists(dest_path):  # Avoid duplicate copies
-                        shutil.copy2(path, dest_path)
+            for pc in photo_clusters:
+                photo = session.query(Photo).filter_by(photo_id=pc.photo_id).first()
+                if photo and os.path.exists(photo.path):
+                    dest_path = os.path.join(person_folder, photo.filename)
+                    if not os.path.exists(dest_path):  # Avoid duplicates
+                        shutil.copy2(photo.path, dest_path)
                         organized_count += 1
         
-        conn.close()
+        session.close()
+        
+        logger.info(f"✓ Organized {organized_count} photos into folders")
         
         return jsonify({
             'success': True,
@@ -472,56 +639,84 @@ def organize_photos():
         })
         
     except Exception as e:
-        import traceback
-        print(traceback.format_exc())
+        session.close()
+        logger.error(f"Error organizing photos: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
-    """Get statistics about processed photos"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    """Get statistics about the photo library"""
+    session = Session()
     
-    c.execute('SELECT COUNT(*) FROM photos')
-    total_photos = c.fetchone()[0]
-    
-    c.execute('SELECT COUNT(*) FROM clusters')
-    total_clusters = c.fetchone()[0]
-    
-    c.execute('SELECT SUM(face_count) FROM clusters')
-    total_faces = c.fetchone()[0] or 0
-    
-    c.execute('SELECT COUNT(*) FROM face_embeddings')
-    processed_faces = c.fetchone()[0]
-    
-    conn.close()
-    
-    return jsonify({
-        'total_photos': total_photos,
-        'total_clusters': total_clusters,
-        'total_faces': total_faces,
-        'processed_faces': processed_faces
-    })
+    try:
+        stats = {
+            'total_photos': session.query(Photo).count(),
+            'total_clusters': session.query(Cluster).count(),
+            'processed_faces': session.query(FaceEmbedding).count(),
+            'detected_objects': session.query(DetectedObject).count(),
+            'photos_with_emotions': session.query(Photo).filter(
+                Photo.dominant_emotion != None
+            ).count(),
+            'photos_with_scenes': session.query(Photo).filter(
+                Photo.scene_type != None
+            ).count()
+        }
+        
+        session.close()
+        return jsonify(stats)
+        
+    except Exception as e:
+        session.close()
+        logger.error(f"Error getting stats: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/reset', methods=['POST'])
 def reset_database():
-    """Reset all data (for testing)"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('DELETE FROM photo_clusters')
-    c.execute('DELETE FROM face_embeddings')
-    c.execute('DELETE FROM photos')
-    c.execute('DELETE FROM clusters')
-    conn.commit()
-    conn.close()
+    """
+    Reset all data (for testing/development)
+    WARNING: This deletes everything!
+    """
+    session = Session()
     
-    # Clear folders
-    for folder in [UPLOAD_FOLDER, THUMBNAILS_FOLDER, ORGANIZED_FOLDER]:
-        if os.path.exists(folder):
-            shutil.rmtree(folder)
-        os.makedirs(folder, exist_ok=True)
-    
-    return jsonify({'success': True, 'message': 'All data reset'})
+    try:
+        # Delete all records (cascade will handle relationships)
+        session.query(PhotoCluster).delete()
+        session.query(FaceEmbedding).delete()
+        session.query(DetectedObject).delete()
+        session.query(Cluster).delete()
+        session.query(Photo).delete()
+        session.commit()
+        session.close()
+        
+        # Clear folders
+        for folder in [UPLOAD_FOLDER, THUMBNAILS_FOLDER, ORGANIZED_FOLDER]:
+            if os.path.exists(folder):
+                shutil.rmtree(folder)
+            os.makedirs(folder, exist_ok=True)
+        
+        logger.info("✓ Database reset complete")
+        
+        return jsonify({
+            'success': True,
+            'message': 'All data reset'
+        })
+        
+    except Exception as e:
+        session.rollback()
+        session.close()
+        logger.error(f"Error resetting database: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================================
+# MAIN
+# ============================================================================
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5002)
+    logger.info("\n" + "="*60)
+    logger.info("🚀 Starting Lumeo Photo Organizer Backend")
+    logger.info("="*60)
+    logger.info(f"   Upload folder: {UPLOAD_FOLDER}")
+    logger.info(f"   Services: {'✓ Available' if SERVICES_AVAILABLE else '✗ Not Available'}")
+    logger.info("="*60 + "\n")
+    
+    app.run(debug=True, port=5002, host='0.0.0.0')

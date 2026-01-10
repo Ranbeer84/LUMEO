@@ -1,438 +1,196 @@
 """
-SQLAlchemy ORM Models for Lumeo
-Replaces direct SQLite database access with ORM
+SQLAlchemy Models for Lumeo - Phase 2 Enhanced
+Includes all vision intelligence features
 """
 
-from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, DateTime, Text, ARRAY, ForeignKey, CheckConstraint, Index
+from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, Text, ForeignKey, LargeBinary
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.dialects.postgresql import JSON
 from pgvector.sqlalchemy import Vector
-import uuid
 from datetime import datetime
-
-
-# DATABASE CONFIGURATION
-
-
-# Database URL (from environment variable or direct)
 import os
-DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://lumeo_user:lumeo_123@localhost:5432/lumeo_db')
+from dotenv import load_dotenv
 
-# Create engine
-engine = create_engine(
-    DATABASE_URL,
-    echo=False,  # Set to True for SQL query logging
-    pool_size=10,
-    max_overflow=20,
-    pool_pre_ping=True  # Verify connections before use
-)
+load_dotenv()
 
-# Create session factory
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# Database configuration
+DB_NAME = os.getenv('DB_NAME', 'lumeo_db')
+DB_USER = os.getenv('DB_USER', 'lumeo_user')
+DB_PASSWORD = os.getenv('DB_PASSWORD', 'lumeo_password')
+DB_HOST = os.getenv('DB_HOST', 'localhost')
+DB_PORT = os.getenv('DB_PORT', '5432')
 
-# Base class for models
+DATABASE_URL = f'postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}'
+
+# Create engine and session
+engine = create_engine(DATABASE_URL, echo=False)
+Session = sessionmaker(bind=engine)
 Base = declarative_base()
 
 
-# ORM MODELS
-
-
 class Photo(Base):
-    """Photos table - core photo storage"""
+    """Photo model with enhanced metadata"""
     __tablename__ = 'photos'
     
-    # Primary key
-    photo_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    
-    # File information
+    # Original fields (Phase 1)
+    photo_id = Column(String(255), primary_key=True)
     filename = Column(String(255), nullable=False)
-    file_path = Column(Text, nullable=False)
-    file_size = Column(Integer)
-    file_hash = Column(String(64))
+    path = Column(String(500), nullable=False)
+    upload_date = Column(Float, nullable=False)
     
-    # Timestamps
-    upload_date = Column(DateTime, default=datetime.utcnow)
-    taken_date = Column(DateTime)
-    processed_date = Column(DateTime)
+    # Phase 2: Vision Intelligence
+    clip_embedding = Column(Vector(512))  # CLIP embedding for semantic search
+    scene_type = Column(String(20))  # indoor/outdoor
+    location_type = Column(String(50))  # beach, office, home, etc. (matches DB column)
+    activity = Column(String(50))  # sports, dining, party, etc.
     
-    # Image metadata
-    width = Column(Integer)
-    height = Column(Integer)
-    format = Column(String(10))
+    # Phase 2: Temporal Context
+    season = Column(String(20))  # winter, spring, summer, autumn
+    time_of_day = Column(String(20))  # morning, afternoon, evening, night
+    date_taken = Column(DateTime)  # From EXIF
+    
+    # Phase 2: Camera Metadata
     camera_make = Column(String(100))
     camera_model = Column(String(100))
     
-    # Location
-    latitude = Column(Float)
-    longitude = Column(Float)
-    location_name = Column(Text)
+    # Phase 2: GPS
+    gps_latitude = Column(Float)
+    gps_longitude = Column(Float)
     
-    # Temporal context
-    season = Column(String(20))
-    time_of_day = Column(String(20))
-    year = Column(Integer)
-    month = Column(Integer)
-    day_of_week = Column(String(10))
+    # Phase 2: Image Quality
+    image_quality = Column(Float)  # 0-1 quality score
     
-    # Scene classification
-    scene_type = Column(String(50))
-    activity = Column(String(50))
-    is_indoor = Column(Boolean)
+    # Phase 2: AI-Generated Content
+    caption = Column(Text)  # Auto-generated natural language caption
     
-    # Quality metrics
-    blur_score = Column(Float)
-    brightness_score = Column(Float)
-    overall_quality = Column(Float)
-    
-    # Emotions
-    dominant_emotion = Column(String(20))
-    emotion_confidence = Column(Float)
-    overall_mood_score = Column(Float)
-    
-    # CLIP embeddings
-    clip_embedding = Column(Vector(512))
-    
-    # Captions
-    generated_caption = Column(Text)
-    user_caption = Column(Text)
-    searchable_text = Column(Text)
-    
-    # Processing status
-    is_processed = Column(Boolean, default=False)
-    processing_error = Column(Text)
-    
-    # Soft delete
-    is_deleted = Column(Boolean, default=False)
-    deleted_date = Column(DateTime)
+    # Phase 2: Emotion Analysis
+    dominant_emotion = Column(String(20))  # Overall photo emotion
+    mood_score = Column(Float)  # -1 (negative) to +1 (positive)
     
     # Relationships
-    face_embeddings = relationship("FaceEmbedding", back_populates="photo", cascade="all, delete-orphan")
-    detected_objects = relationship("DetectedObject", back_populates="photo", cascade="all, delete-orphan")
-    photo_emotion = relationship("PhotoEmotion", back_populates="photo", uselist=False)
-    clusters = relationship("Cluster", secondary="photo_clusters", back_populates="photos")
-    
-    # Constraints
-    __table_args__ = (
-        CheckConstraint('overall_mood_score >= -1 AND overall_mood_score <= 1', name='valid_mood_score'),
-        CheckConstraint('overall_quality >= 0 AND overall_quality <= 100', name='valid_quality'),
-        Index('idx_photos_upload_date', 'upload_date'),
-        Index('idx_photos_taken_date', 'taken_date'),
-        Index('idx_photos_season', 'season'),
-        Index('idx_photos_scene_type', 'scene_type'),
-        Index('idx_photos_is_processed', 'is_processed'),
-    )
+    face_embeddings = relationship('FaceEmbedding', back_populates='photo', cascade='all, delete-orphan')
+    photo_clusters = relationship('PhotoCluster', back_populates='photo', cascade='all, delete-orphan')
+    detected_objects = relationship('DetectedObject', back_populates='photo', cascade='all, delete-orphan')
     
     def __repr__(self):
-        return f"<Photo(id={self.photo_id}, filename={self.filename})>"
+        return f"<Photo(id={self.photo_id}, filename={self.filename}, scene={self.scene_type})>"
 
 
 class Cluster(Base):
-    """Clusters table - represents unique people"""
+    """Cluster/Person model"""
     __tablename__ = 'clusters'
     
-    # Primary key
-    cluster_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    
-    # Cluster info
-    name = Column(String(100), nullable=False, default='Unknown Person')
+    cluster_id = Column(String(255), primary_key=True)
+    name = Column(String(255), nullable=False)
     face_count = Column(Integer, default=0)
-    photo_count = Column(Integer, default=0)
-    
-    # Representative face
-    thumbnail_path = Column(Text)
-    representative_embedding = Column(Vector(128))
-    
-    # Quality
-    avg_face_quality = Column(Float)
-    
-    # User metadata
-    notes = Column(Text)
-    relationship_type = Column(String(50))  # family, friend, etc.
-    
-    # Timestamps
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    # Soft delete
-    is_deleted = Column(Boolean, default=False)
+    thumbnail = Column(String(255))
+    created_at = Column(Float, nullable=False)
     
     # Relationships
-    face_embeddings = relationship("FaceEmbedding", back_populates="cluster")
-    photos = relationship("Photo", secondary="photo_clusters", back_populates="clusters")
-    
-    __table_args__ = (
-        Index('idx_clusters_name', 'name'),
-    )
+    face_embeddings = relationship('FaceEmbedding', back_populates='cluster', cascade='all, delete-orphan')
+    photo_clusters = relationship('PhotoCluster', back_populates='cluster', cascade='all, delete-orphan')
     
     def __repr__(self):
         return f"<Cluster(id={self.cluster_id}, name={self.name}, faces={self.face_count})>"
 
 
 class FaceEmbedding(Base):
-    """Face embeddings table - individual detected faces"""
+    """Face embedding with emotion and quality"""
     __tablename__ = 'face_embeddings'
     
-    # Primary key
-    embedding_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    embedding_id = Column(Integer, primary_key=True, autoincrement=True)
+    photo_id = Column(String(255), ForeignKey('photos.photo_id', ondelete='CASCADE'))
+    cluster_id = Column(String(255), ForeignKey('clusters.cluster_id', ondelete='CASCADE'))
+    embedding = Column(LargeBinary, nullable=False)  # Face encoding
+    face_location = Column(Text)  # JSON string of (top, right, bottom, left)
     
-    # Foreign keys
-    photo_id = Column(UUID(as_uuid=True), ForeignKey('photos.photo_id', ondelete='CASCADE'), nullable=False)
-    cluster_id = Column(UUID(as_uuid=True), ForeignKey('clusters.cluster_id', ondelete='SET NULL'))
+    # Phase 2: Emotion Analysis
+    emotion = Column(String(20))  # happy, sad, angry, surprise, neutral, fear, disgust
+    emotion_confidence = Column(Float)  # 0-1 confidence score
+    emotion_valence = Column(Float)  # -1 (negative) to +1 (positive)
     
-    # Face data
-    face_location = Column(JSONB, nullable=False)
-    face_landmarks = Column(JSONB)
-    face_encoding = Column(Vector(128), nullable=False)
-    
-    # Quality metrics
-    quality_score = Column(Float)
-    sharpness = Column(Float)
-    brightness = Column(Float)
-    face_size = Column(Integer)
-    angle_score = Column(Float)
-    
-    # Emotion
-    emotion = Column(String(20))
-    emotion_confidence = Column(Float)
-    emotion_scores = Column(JSONB)
-    
-    # Timestamp
-    detected_at = Column(DateTime, default=datetime.utcnow)
+    # Phase 2: Quality Assessment
+    quality_score = Column(Float)  # 0-1 face quality score
     
     # Relationships
-    photo = relationship("Photo", back_populates="face_embeddings")
-    cluster = relationship("Cluster", back_populates="face_embeddings")
-    
-    __table_args__ = (
-        CheckConstraint('quality_score >= 0 AND quality_score <= 100', name='valid_quality'),
-        CheckConstraint('emotion_confidence >= 0 AND emotion_confidence <= 100', name='valid_emotion_confidence'),
-        Index('idx_face_embeddings_photo', 'photo_id'),
-        Index('idx_face_embeddings_cluster', 'cluster_id'),
-        Index('idx_face_embeddings_emotion', 'emotion'),
-    )
+    photo = relationship('Photo', back_populates='face_embeddings')
+    cluster = relationship('Cluster', back_populates='face_embeddings')
     
     def __repr__(self):
-        return f"<FaceEmbedding(id={self.embedding_id}, emotion={self.emotion})>"
+        return f"<FaceEmbedding(id={self.embedding_id}, emotion={self.emotion}, quality={self.quality_score})>"
 
 
 class PhotoCluster(Base):
-    """Junction table for many-to-many Photo-Cluster relationship"""
+    """Junction table for many-to-many photo-cluster relationship"""
     __tablename__ = 'photo_clusters'
     
-    # Composite primary key
-    photo_id = Column(UUID(as_uuid=True), ForeignKey('photos.photo_id', ondelete='CASCADE'), primary_key=True)
-    cluster_id = Column(UUID(as_uuid=True), ForeignKey('clusters.cluster_id', ondelete='CASCADE'), primary_key=True)
+    photo_id = Column(String(255), ForeignKey('photos.photo_id', ondelete='CASCADE'), primary_key=True)
+    cluster_id = Column(String(255), ForeignKey('clusters.cluster_id', ondelete='CASCADE'), primary_key=True)
     
-    # Metadata
-    face_count_in_photo = Column(Integer, default=1)
-    is_primary_subject = Column(Boolean, default=False)
-    added_at = Column(DateTime, default=datetime.utcnow)
+    # Relationships
+    photo = relationship('Photo', back_populates='photo_clusters')
+    cluster = relationship('Cluster', back_populates='photo_clusters')
     
-    __table_args__ = (
-        Index('idx_photo_clusters_photo', 'photo_id'),
-        Index('idx_photo_clusters_cluster', 'cluster_id'),
-    )
+    def __repr__(self):
+        return f"<PhotoCluster(photo={self.photo_id}, cluster={self.cluster_id})>"
 
 
 class DetectedObject(Base):
-    """Detected objects table - YOLO results"""
+    """Detected objects from YOLO"""
     __tablename__ = 'detected_objects'
     
-    # Primary key
-    object_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    object_id = Column(Integer, primary_key=True, autoincrement=True)
+    photo_id = Column(String(255), ForeignKey('photos.photo_id', ondelete='CASCADE'), nullable=False)
     
-    # Foreign key
-    photo_id = Column(UUID(as_uuid=True), ForeignKey('photos.photo_id', ondelete='CASCADE'), nullable=False)
+    # Object Detection Data
+    label = Column(String(100), nullable=False)  # car, person, cake, etc.
+    confidence = Column(Float, nullable=False)  # 0-1 confidence score
     
-    # Object data
-    label = Column(String(100), nullable=False)
-    confidence = Column(Float)
-    bounding_box = Column(JSONB, nullable=False)
+    # Bounding Box
+    bbox_x1 = Column(Integer)
+    bbox_y1 = Column(Integer)
+    bbox_x2 = Column(Integer)
+    bbox_y2 = Column(Integer)
     
-    # Attributes
-    dominant_color = Column(String(50))
-    color_hex = Column(String(7))
-    size_category = Column(String(20))
+    # Color Information
+    dominant_color_rgb = Column(String(50))  # "(255, 128, 64)"
+    color_name = Column(String(50))  # "red", "blue", etc.
     
-    # Timestamp
-    detected_at = Column(DateTime, default=datetime.utcnow)
-    
-    # Relationship
-    photo = relationship("Photo", back_populates="detected_objects")
-    
-    __table_args__ = (
-        CheckConstraint('confidence >= 0 AND confidence <= 100', name='valid_confidence'),
-        Index('idx_detected_objects_photo', 'photo_id'),
-        Index('idx_detected_objects_label', 'label'),
-    )
-    
-    def __repr__(self):
-        return f"<DetectedObject(id={self.object_id}, label={self.label})>"
-
-
-class PhotoEmotion(Base):
-    """Aggregated emotion data per photo"""
-    __tablename__ = 'photo_emotions'
-    
-    # Primary key (one-to-one with photos)
-    photo_id = Column(UUID(as_uuid=True), ForeignKey('photos.photo_id', ondelete='CASCADE'), primary_key=True)
-    
-    # Emotion counts
-    happy_count = Column(Integer, default=0)
-    sad_count = Column(Integer, default=0)
-    angry_count = Column(Integer, default=0)
-    surprise_count = Column(Integer, default=0)
-    fear_count = Column(Integer, default=0)
-    disgust_count = Column(Integer, default=0)
-    neutral_count = Column(Integer, default=0)
-    
-    # Dominant emotion
-    dominant_emotion = Column(String(20))
-    dominant_emotion_percentage = Column(Float)
-    
-    # Overall mood
-    overall_mood = Column(String(20))
-    mood_score = Column(Float)
-    
-    # Timestamp
-    analyzed_at = Column(DateTime, default=datetime.utcnow)
-    
-    # Relationship
-    photo = relationship("Photo", back_populates="photo_emotion")
-    
-    __table_args__ = (
-        CheckConstraint('mood_score >= -1 AND mood_score <= 1', name='valid_mood_score'),
-        Index('idx_photo_emotions_dominant', 'dominant_emotion'),
-    )
-
-
-class Conversation(Base):
-    """Conversations table - chat sessions"""
-    __tablename__ = 'conversations'
-    
-    # Primary key
-    conversation_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    
-    # Conversation metadata
-    title = Column(Text)
-    summary = Column(Text)
-    
-    # Timestamps
-    started_at = Column(DateTime, default=datetime.utcnow)
-    last_message_at = Column(DateTime, default=datetime.utcnow)
-    
-    # State
-    is_active = Column(Boolean, default=True)
-    message_count = Column(Integer, default=0)
-    
-    # Relationships
-    messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan")
-    
-    __table_args__ = (
-        CheckConstraint('message_count >= 0', name='valid_message_count'),
-        Index('idx_conversations_started_at', 'started_at'),
-    )
-    
-    def __repr__(self):
-        return f"<Conversation(id={self.conversation_id}, messages={self.message_count})>"
-
-
-class Message(Base):
-    """Messages table - user queries and AI responses"""
-    __tablename__ = 'messages'
-    
-    # Primary key
-    message_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    
-    # Foreign key
-    conversation_id = Column(UUID(as_uuid=True), ForeignKey('conversations.conversation_id', ondelete='CASCADE'), nullable=False)
-    
-    # Message content
-    role = Column(String(20), nullable=False)  # 'user' or 'assistant'
-    content = Column(Text, nullable=False)
-    
-    # Query metadata
-    query_embedding = Column(Vector(512))
-    parsed_entities = Column(JSONB)
-    
-    # Retrieved context
-    retrieved_photo_ids = Column(ARRAY(UUID(as_uuid=True)))
-    retrieval_scores = Column(ARRAY(Float))
-    context_used = Column(Text)
-    
-    # Generation metadata
-    model_name = Column(String(50))
-    tokens_used = Column(Integer)
-    generation_time_ms = Column(Integer)
-    
-    # Feedback
-    thumbs_up = Column(Boolean)
-    thumbs_down = Column(Boolean)
-    user_feedback = Column(Text)
-    
-    # Timestamp
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationship
-    conversation = relationship("Conversation", back_populates="messages")
-    
-    __table_args__ = (
-        CheckConstraint("role IN ('user', 'assistant')", name='valid_role'),
-        Index('idx_messages_conversation', 'conversation_id'),
-        Index('idx_messages_role', 'role'),
-    )
+    photo = relationship('Photo', back_populates='detected_objects')
     
     def __repr__(self):
-        return f"<Message(id={self.message_id}, role={self.role})>"
+        return f"<DetectedObject(id={self.object_id}, label={self.label}, confidence={self.confidence:.2f})>"
 
 
-
-# HELPER FUNCTIONS
-
-
-def get_db():
-    """Get database session (for use in Flask routes)"""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
+# Create all tables (if they don't exist)
 def init_db():
-    """Initialize database (create all tables)"""
-    Base.metadata.create_all(bind=engine)
-    print("Database initialized successfully!")
-
-def drop_all_tables():
-    """Drop all tables (WARNING: DESTRUCTIVE)"""
-    Base.metadata.drop_all(bind=engine)
-    print("All tables dropped!")
+    """Initialize database tables"""
+    Base.metadata.create_all(engine)
+    print("✓ Database tables initialized")
 
 
-# EXAMPLE USAGE
-
-
-if __name__ == "__main__":
-    # Initialize database
-    init_db()
-    
-    # Example: Create a photo
-    session = SessionLocal()
-    
-    new_photo = Photo(
-        filename="test.jpg",
-        file_path="/uploads/test.jpg",
-        is_processed=False
-    )
-    
-    session.add(new_photo)
-    session.commit()
-    
-    print(f"Created photo: {new_photo}")
-    
-    # Example: Query photos
-    photos = session.query(Photo).filter_by(is_processed=False).all()
-    print(f"Unprocessed photos: {len(photos)}")
-    
-    session.close()
+if __name__ == '__main__':
+    # Test database connection
+    try:
+        print(f"Connecting to: {DATABASE_URL.replace(DB_PASSWORD, '***')}")
+        init_db()
+        
+        # Test query
+        session = Session()
+        photo_count = session.query(Photo).count()
+        cluster_count = session.query(Cluster).count()
+        object_count = session.query(DetectedObject).count()
+        
+        print(f"✓ Database connected successfully")
+        print(f"  - Photos: {photo_count}")
+        print(f"  - Clusters: {cluster_count}")
+        print(f"  - Objects: {object_count}")
+        
+        session.close()
+        
+    except Exception as e:
+        print(f"✗ Database connection failed: {e}")
