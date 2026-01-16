@@ -32,6 +32,12 @@ try:
     from services.pipeline_service import get_pipeline
     from services.face_service import get_face_service
     from services.clip_service import get_clip_service
+
+    from services.query_service import get_query_service
+    from services.retrieval_service import get_retrieval_service
+    from services.context_service import get_context_service
+    from services.query_parser import get_query_parser
+    
     SERVICES_AVAILABLE = True
 except ImportError as e:
     print(f"⚠️  WARNING: Services not available: {e}")
@@ -706,6 +712,395 @@ def reset_database():
         session.close()
         logger.error(f"Error resetting database: {str(e)}")
         return jsonify({'error': str(e)}), 500
+    
+@app.route('/api/search', methods=['POST'])
+def search_photos():
+    """
+    Natural language photo search with hybrid retrieval
+    
+    Request body:
+        {
+            "query": "beach photos with Mom from last summer",
+            "top_k": 10,
+            "use_filters": true
+        }
+    
+    Returns: List of retrieved photos with similarity scores
+    """
+    if not SERVICES_AVAILABLE:
+        return jsonify({'error': 'Services not available'}), 500
+    
+    try:
+        data = request.json
+        query = data.get('query', '')
+        top_k = data.get('top_k', 10)
+        use_filters = data.get('use_filters', True)
+        
+        if not query:
+            return jsonify({'error': 'Query is required'}), 400
+        
+        logger.info(f"=== SEARCH REQUEST ===")
+        logger.info(f"Query: {query}")
+        logger.info(f"Top K: {top_k}")
+        logger.info(f"Use filters: {use_filters}")
+        
+        # Get services
+        query_service = get_query_service()
+        retrieval_service = get_retrieval_service()
+        
+        # Step 1: Parse query into structured filters
+        session = Session()
+        clusters = session.query(Cluster).all()
+        known_people = [c.name for c in clusters]
+        session.close()
+        
+        parser = get_query_parser(known_people)
+        parsed_filters = parser.parse(query)
+        
+        logger.info(f"Parsed filters: {parsed_filters}")
+        
+        # Step 2: Generate query embedding
+        query_embedding = query_service.encode_query(query)
+        
+        if query_embedding is None:
+            return jsonify({'error': 'Failed to encode query'}), 500
+        
+        # Step 3: Perform hybrid search
+        if use_filters and len(parsed_filters) > 1:  # Has filters beyond raw_query
+            # Remove raw_query from filters for database search
+            db_filters = {k: v for k, v in parsed_filters.items() if k != 'raw_query'}
+            results = retrieval_service.hybrid_search(
+                query_embedding,
+                filters=db_filters,
+                top_k=top_k
+            )
+        else:
+            # Pure semantic search
+            results = retrieval_service.semantic_search(
+                query_embedding,
+                top_k=top_k,
+                min_similarity=0.3
+            )
+        
+        logger.info(f"✓ Retrieved {len(results)} photos")
+        
+        return jsonify({
+            'success': True,
+            'query': query,
+            'parsed_filters': parsed_filters,
+            'results_count': len(results),
+            'results': results
+        })
+        
+    except Exception as e:
+        logger.error(f"Search error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/search/context', methods=['POST'])
+def get_search_context():
+    """
+    Get LLM-ready context for search results
+    
+    Request body:
+        {
+            "query": "beach photos with Mom",
+            "top_k": 10,
+            "include_system_prompt": true
+        }
+    
+    Returns: Formatted context string ready for LLM
+    """
+    if not SERVICES_AVAILABLE:
+        return jsonify({'error': 'Services not available'}), 500
+    
+    try:
+        data = request.json
+        query = data.get('query', '')
+        top_k = data.get('top_k', 10)
+        include_system_prompt = data.get('include_system_prompt', True)
+        
+        if not query:
+            return jsonify({'error': 'Query is required'}), 400
+        
+        # Get services
+        query_service = get_query_service()
+        retrieval_service = get_retrieval_service()
+        context_service = get_context_service()
+        
+        # Parse query
+        session = Session()
+        clusters = session.query(Cluster).all()
+        known_people = [c.name for c in clusters]
+        session.close()
+        
+        parser = get_query_parser(known_people)
+        parsed_filters = parser.parse(query)
+        
+        # Generate embedding
+        query_embedding = query_service.encode_query(query)
+        
+        if query_embedding is None:
+            return jsonify({'error': 'Failed to encode query'}), 500
+        
+        # Search
+        db_filters = {k: v for k, v in parsed_filters.items() if k != 'raw_query'}
+        results = retrieval_service.hybrid_search(
+            query_embedding,
+            filters=db_filters,
+            top_k=top_k
+        )
+        
+        # Build context
+        context = context_service.build_context(
+            results,
+            query,
+            include_system_prompt=include_system_prompt
+        )
+        
+        estimated_tokens = context_service.estimate_tokens(context)
+        
+        logger.info(f"✓ Built context: {len(results)} photos, ~{estimated_tokens} tokens")
+        
+        return jsonify({
+            'success': True,
+            'query': query,
+            'results_count': len(results),
+            'context': context,
+            'estimated_tokens': estimated_tokens
+        })
+        
+    except Exception as e:
+        logger.error(f"Context generation error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/search/similar/<photo_id>', methods=['GET'])
+def find_similar_photos(photo_id):
+    """
+    Find photos similar to a given photo
+    
+    URL params:
+        - top_k: Number of results (default: 10)
+    
+    Returns: List of similar photos
+    """
+    if not SERVICES_AVAILABLE:
+        return jsonify({'error': 'Services not available'}), 500
+    
+    try:
+        top_k = request.args.get('top_k', 10, type=int)
+        
+        retrieval_service = get_retrieval_service()
+        
+        results = retrieval_service.search_by_similar_photo(
+            photo_id,
+            top_k=top_k,
+            exclude_self=True
+        )
+        
+        logger.info(f"✓ Found {len(results)} similar photos to {photo_id}")
+        
+        return jsonify({
+            'success': True,
+            'reference_photo_id': photo_id,
+            'results_count': len(results),
+            'results': results
+        })
+        
+    except Exception as e:
+        logger.error(f"Similar photo search error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/insights/summary', methods=['POST'])
+def generate_summary():
+    """
+    Generate aggregated summary/insights from photos
+    
+    Request body:
+        {
+            "filters": {...},  # Optional filters
+            "summary_type": "general"  # "general", "emotional", "temporal", "people"
+        }
+    
+    Returns: Summary context for LLM
+    """
+    if not SERVICES_AVAILABLE:
+        return jsonify({'error': 'Services not available'}), 500
+    
+    try:
+        data = request.json
+        filters = data.get('filters', {})
+        summary_type = data.get('summary_type', 'general')
+        
+        # Get all photos or filtered subset
+        session = Session()
+        query = session.query(Photo).filter(Photo.clip_embedding.isnot(None))
+        
+        # Apply filters if provided
+        # (You can expand this to apply filters similar to hybrid search)
+        
+        photos = query.limit(100).all()  # Limit for performance
+        
+        # Convert to dict format
+        photo_dicts = []
+        for photo in photos:
+            # Get people
+            photo_clusters = session.query(PhotoCluster).filter_by(
+                photo_id=photo.photo_id
+            ).all()
+            
+            people = []
+            for pc in photo_clusters:
+                cluster = session.query(Cluster).filter_by(
+                    cluster_id=pc.cluster_id
+                ).first()
+                if cluster:
+                    people.append(cluster.name)
+            
+            photo_dicts.append({
+                'photo_id': photo.photo_id,
+                'people': people,
+                'dominant_emotion': photo.dominant_emotion,
+                'location': photo.location_type,
+                'activity': photo.activity,
+                'season': photo.season,
+                'time_of_day': photo.time_of_day
+            })
+        
+        session.close()
+        
+        # Generate summary
+        context_service = get_context_service()
+        summary = context_service.build_summary_context(
+            photo_dicts,
+            summary_type=summary_type
+        )
+        
+        logger.info(f"✓ Generated {summary_type} summary for {len(photo_dicts)} photos")
+        
+        return jsonify({
+            'success': True,
+            'summary_type': summary_type,
+            'photos_analyzed': len(photo_dicts),
+            'summary': summary
+        })
+        
+    except Exception as e:
+        logger.error(f"Summary generation error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/retrieval/stats', methods=['GET'])
+def retrieval_stats():
+    """Get retrieval system statistics"""
+    if not SERVICES_AVAILABLE:
+        return jsonify({'error': 'Services not available'}), 500
+    
+    try:
+        retrieval_service = get_retrieval_service()
+        query_service = get_query_service()
+        
+        stats = retrieval_service.get_retrieval_stats()
+        cache_stats = query_service.get_cache_stats()
+        
+        return jsonify({
+            'success': True,
+            'retrieval_stats': stats,
+            'cache_stats': cache_stats
+        })
+        
+    except Exception as e:
+        logger.error(f"Stats error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/query/parse', methods=['POST'])
+def parse_query():
+    """
+    Test endpoint: Parse a query and show extracted filters
+    
+    Useful for debugging query parsing
+    
+    Request body:
+        {
+            "query": "beach photos with Mom from last summer"
+        }
+    
+    Returns: Parsed filters
+    """
+    try:
+        data = request.json
+        query = data.get('query', '')
+        
+        if not query:
+            return jsonify({'error': 'Query is required'}), 400
+        
+        # Get known people
+        session = Session()
+        clusters = session.query(Cluster).all()
+        known_people = [c.name for c in clusters]
+        session.close()
+        
+        # Parse
+        parser = get_query_parser(known_people)
+        filters = parser.parse(query)
+        
+        # Get semantic query reconstruction
+        semantic_query = parser.get_semantic_query(filters)
+        
+        return jsonify({
+            'success': True,
+            'original_query': query,
+            'parsed_filters': filters,
+            'semantic_query': semantic_query,
+            'known_people': known_people
+        })
+        
+    except Exception as e:
+        logger.error(f"Query parsing error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================================
+# Example: Complete search workflow
+# ============================================================================
+"""
+USAGE EXAMPLE:
+
+1. Simple search:
+POST /api/search
+{
+    "query": "beach photos with Mom",
+    "top_k": 10
+}
+
+2. Get LLM context:
+POST /api/search/context
+{
+    "query": "show me happy family photos from last summer",
+    "top_k": 5,
+    "include_system_prompt": true
+}
+
+3. Find similar photos:
+GET /api/search/similar/photo_123?top_k=10
+
+4. Generate insights:
+POST /api/insights/summary
+{
+    "summary_type": "emotional"
+}
+
+5. Test query parsing:
+POST /api/query/parse
+{
+    "query": "photos where I'm wearing a red dress at the beach"
+}
+"""
 
 # ============================================================================
 # MAIN
