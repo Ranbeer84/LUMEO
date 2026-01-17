@@ -1,9 +1,9 @@
 """
-SQLAlchemy Models for Lumeo - Phase 2 Enhanced
-Includes all vision intelligence features
+SQLAlchemy Models for Lumeo - Phase 4 Enhanced
+Includes conversation and message tables for chat interface
 """
 
-from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, Text, ForeignKey, LargeBinary
+from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, Text, ForeignKey, LargeBinary, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.dialects.postgresql import JSON
@@ -11,6 +11,7 @@ from pgvector.sqlalchemy import Vector
 from datetime import datetime
 import os
 from dotenv import load_dotenv
+import uuid
 
 load_dotenv()
 
@@ -42,7 +43,7 @@ class Photo(Base):
     # Phase 2: Vision Intelligence
     clip_embedding = Column(Vector(512))  # CLIP embedding for semantic search
     scene_type = Column(String(20))  # indoor/outdoor
-    location_type = Column(String(50))  # beach, office, home, etc. (matches DB column)
+    location_type = Column(String(50))  # beach, office, home, etc.
     activity = Column(String(50))  # sports, dining, party, etc.
     
     # Phase 2: Temporal Context
@@ -166,6 +167,54 @@ class DetectedObject(Base):
         return f"<DetectedObject(id={self.object_id}, label={self.label}, confidence={self.confidence:.2f})>"
 
 
+# ============================================================================
+# PHASE 4: CONVERSATION TABLES
+# ============================================================================
+
+class Conversation(Base):
+    """Conversation/chat session"""
+    __tablename__ = 'conversations'
+    
+    conversation_id = Column(String(255), primary_key=True, default=lambda: f"conv_{uuid.uuid4().hex[:12]}")
+    user_id = Column(String(255), default="default_user")  # For multi-user support later
+    
+    created_at = Column(Float, nullable=False)
+    updated_at = Column(Float, nullable=False)
+    
+    # Conversation metadata
+    message_count = Column(Integer, default=0)
+    summary = Column(Text)  # Auto-generated summary of conversation
+    
+    # Relationships
+    messages = relationship('Message', back_populates='conversation', cascade='all, delete-orphan')
+    
+    def __repr__(self):
+        return f"<Conversation(id={self.conversation_id}, messages={self.message_count})>"
+
+
+class Message(Base):
+    """Individual message in a conversation"""
+    __tablename__ = 'messages'
+    
+    message_id = Column(Integer, primary_key=True, autoincrement=True)
+    conversation_id = Column(String(255), ForeignKey('conversations.conversation_id', ondelete='CASCADE'), nullable=False)
+    
+    role = Column(String(20), nullable=False)  # 'user' or 'assistant'
+    content = Column(Text, nullable=False)  # Message text
+    
+    # Retrieved context for this message
+    retrieved_photo_ids = Column(Text)  # JSON list of photo IDs retrieved
+    meta_data = Column(JSON)  # Additional data (similarity scores, filters used, etc.)
+    
+    created_at = Column(Float, nullable=False)
+    
+    # Relationship
+    conversation = relationship('Conversation', back_populates='messages')
+    
+    def __repr__(self):
+        return f"<Message(id={self.message_id}, role={self.role}, conv={self.conversation_id})>"
+
+
 # Create all tables (if they don't exist)
 def init_db():
     """Initialize database tables"""
@@ -184,11 +233,15 @@ if __name__ == '__main__':
         photo_count = session.query(Photo).count()
         cluster_count = session.query(Cluster).count()
         object_count = session.query(DetectedObject).count()
+        conversation_count = session.query(Conversation).count()
+        message_count = session.query(Message).count()
         
         print(f"✓ Database connected successfully")
         print(f"  - Photos: {photo_count}")
         print(f"  - Clusters: {cluster_count}")
         print(f"  - Objects: {object_count}")
+        print(f"  - Conversations: {conversation_count}")
+        print(f"  - Messages: {message_count}")
         
         session.close()
         
