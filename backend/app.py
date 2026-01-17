@@ -1,17 +1,4 @@
-"""
-Lumeo Photo Organizer Backend - Complete Phase 2
-Uses PostgreSQL + SQLAlchemy + Vision Intelligence Pipeline
-
-Features:
-- Face recognition with quality assessment
-- Emotion detection
-- Object detection with YOLO
-- Scene classification
-- CLIP embeddings
-- Metadata extraction
-"""
-
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 from flask_cors import CORS
 import os
 import shutil
@@ -37,6 +24,9 @@ try:
     from services.retrieval_service import get_retrieval_service
     from services.context_service import get_context_service
     from services.query_parser import get_query_parser
+
+    from services.llm_service import get_llm_service
+    from services.conversation_service import get_conversation_service
     
     SERVICES_AVAILABLE = True
 except ImportError as e:
@@ -1100,6 +1090,488 @@ POST /api/query/parse
 {
     "query": "photos where I'm wearing a red dress at the beach"
 }
+"""
+
+# ============================================================================
+# PHASE 4: CHAT / LLM ROUTES
+# ============================================================================
+
+@app.route('/api/chat', methods=['POST'])
+def chat():
+    """
+    Send a message and get LLM response
+    
+    Request body:
+        {
+            "message": "Show me happy beach photos",
+            "conversation_id": "conv_abc123",  // optional
+            "top_k": 5,
+            "stream": false
+        }
+    
+    Returns: LLM response with retrieved photos
+    """
+    if not SERVICES_AVAILABLE:
+        return jsonify({'error': 'Services not available'}), 500
+    
+    try:
+        data = request.json
+        message = data.get('message', '')
+        conversation_id = data.get('conversation_id')
+        top_k = data.get('top_k', 5)
+        use_streaming = data.get('stream', False)
+        
+        if not message:
+            return jsonify({'error': 'Message is required'}), 400
+        
+        logger.info(f"=== CHAT REQUEST ===")
+        logger.info(f"Message: {message}")
+        logger.info(f"Conversation: {conversation_id}")
+        
+        # Get services
+        query_service = get_query_service()
+        retrieval_service = get_retrieval_service()
+        context_service = get_context_service()
+        llm_service = get_llm_service()
+        conversation_service = get_conversation_service()
+        
+        session = Session()
+        
+        # Create new conversation if needed
+        if not conversation_id:
+            conversation_id = conversation_service.create_conversation(session)
+            logger.info(f"Created new conversation: {conversation_id}")
+        
+        # Parse query
+        clusters = session.query(Cluster).all()
+        known_people = [c.name for c in clusters]
+        
+        parser = get_query_parser(known_people)
+        parsed_filters = parser.parse(message)
+        
+        # Generate query embedding
+        query_embedding = query_service.encode_query(message)
+        
+        if query_embedding is None:
+            session.close()
+            return jsonify({'error': 'Failed to encode query'}), 500
+        
+        # Retrieve photos
+        db_filters = {k: v for k, v in parsed_filters.items() if k != 'raw_query'}
+        retrieved_photos = retrieval_service.hybrid_search(
+            query_embedding,
+            filters=db_filters,
+            top_k=top_k
+        )
+        
+        logger.info(f"✓ Retrieved {len(retrieved_photos)} photos")
+        
+        # Build context
+        photo_context = context_service.build_context(
+            retrieved_photos,
+            message,
+            include_system_prompt=False  # We'll add it in LLM service
+        )
+        
+        # Include conversation history
+        full_context = conversation_service.build_context_with_history(
+            session,
+            conversation_id,
+            message,
+            photo_context
+        )
+        
+        # Save user message
+        photo_ids = [p['photo_id'] for p in retrieved_photos]
+        conversation_service.add_message(
+            session,
+            conversation_id,
+            role='user',
+            content=message,
+            retrieved_photo_ids=photo_ids,
+            metadata={
+                'filters': parsed_filters,
+                'results_count': len(retrieved_photos)
+            }
+        )
+        
+        # Generate LLM response
+        if use_streaming:
+            # Return streaming response
+            session.close()
+            return Response(
+                stream_chat_response(
+                    llm_service,
+                    conversation_service,
+                    conversation_id,
+                    full_context,
+                    message,
+                    retrieved_photos
+                ),
+                mimetype='text/event-stream'
+            )
+        else:
+            # Generate complete response
+            response_text = llm_service.generate_response(
+                context=full_context,
+                query=message
+            )
+            
+            # Validate response
+            validation = llm_service.validate_response(response_text, full_context)
+            
+            # Save assistant message
+            conversation_service.add_message(
+                session,
+                conversation_id,
+                role='assistant',
+                content=response_text,
+                metadata={
+                    'validation': validation
+                }
+            )
+            
+            session.close()
+            
+            logger.info(f"✓ Generated response ({len(response_text)} chars)")
+            
+            return jsonify({
+                'success': True,
+                'conversation_id': conversation_id,
+                'message': message,
+                'response': response_text,
+                'retrieved_photos': retrieved_photos,
+                'validation': validation
+            })
+        
+    except Exception as e:
+        logger.error(f"Chat error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+
+def stream_chat_response(llm_service, conversation_service, conversation_id, context, query, retrieved_photos):
+    """
+    Generator for streaming chat responses
+    
+    Yields Server-Sent Events (SSE) format
+    """
+    full_response = []
+    
+    try:
+        # First, send retrieved photos
+        yield f"data: {json.dumps({'type': 'photos', 'photos': retrieved_photos})}\n\n"
+        
+        # Then stream LLM response
+        for chunk in llm_service.generate_streaming_response(context, query):
+            full_response.append(chunk)
+            yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
+        
+        # Save complete response
+        response_text = ''.join(full_response)
+        
+        session = Session()
+        conversation_service.add_message(
+            session,
+            conversation_id,
+            role='assistant',
+            content=response_text
+        )
+        session.close()
+        
+        # Send completion event
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        
+    except Exception as e:
+        logger.error(f"Streaming error: {str(e)}")
+        yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+
+
+@app.route('/api/chat/stream', methods=['POST'])
+def chat_stream():
+    """
+    Streaming chat endpoint (alias for chat with stream=true)
+    """
+    data = request.json or {}
+    data['stream'] = True
+    request.json = data
+    return chat()
+
+
+@app.route('/api/conversations', methods=['GET'])
+def get_conversations():
+    """
+    Get all conversations
+    
+    Query params:
+        - limit: Max conversations to return (default: 20)
+    """
+    try:
+        limit = request.args.get('limit', 20, type=int)
+        
+        session = Session()
+        conversation_service = get_conversation_service()
+        
+        conversations = conversation_service.get_all_conversations(
+            session,
+            limit=limit
+        )
+        
+        session.close()
+        
+        return jsonify({
+            'success': True,
+            'conversations': conversations
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting conversations: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/conversation/<conversation_id>', methods=['GET'])
+def get_conversation(conversation_id):
+    """Get conversation history"""
+    try:
+        session = Session()
+        conversation_service = get_conversation_service()
+        
+        # Get messages
+        history = conversation_service.get_conversation_history(
+            session,
+            conversation_id
+        )
+        
+        # Get stats
+        stats = conversation_service.get_conversation_stats(
+            session,
+            conversation_id
+        )
+        
+        session.close()
+        
+        return jsonify({
+            'success': True,
+            'conversation_id': conversation_id,
+            'messages': history,
+            'stats': stats
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting conversation: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/conversation/new', methods=['POST'])
+def new_conversation():
+    """Start a new conversation"""
+    try:
+        session = Session()
+        conversation_service = get_conversation_service()
+        
+        conversation_id = conversation_service.create_conversation(session)
+        
+        session.close()
+        
+        return jsonify({
+            'success': True,
+            'conversation_id': conversation_id
+        })
+        
+    except Exception as e:
+        logger.error(f"Error creating conversation: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/conversation/<conversation_id>', methods=['DELETE'])
+def delete_conversation(conversation_id):
+    """Delete a conversation"""
+    try:
+        session = Session()
+        conversation_service = get_conversation_service()
+        
+        success = conversation_service.delete_conversation(
+            session,
+            conversation_id
+        )
+        
+        session.close()
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'message': f'Conversation {conversation_id} deleted'
+            })
+        else:
+            return jsonify({'error': 'Failed to delete conversation'}), 500
+        
+    except Exception as e:
+        logger.error(f"Error deleting conversation: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/insights', methods=['POST'])
+def generate_insights():
+    """
+    Generate insights from photo collection
+    
+    Request body:
+        {
+            "insight_type": "emotional",  // emotional, social, temporal, general
+            "filters": {...}  // optional filters
+        }
+    """
+    if not SERVICES_AVAILABLE:
+        return jsonify({'error': 'Services not available'}), 500
+    
+    try:
+        data = request.json
+        insight_type = data.get('insight_type', 'general')
+        filters = data.get('filters', {})
+        
+        # Get photos
+        session = Session()
+        query = session.query(Photo).filter(Photo.clip_embedding.isnot(None))
+        photos = query.limit(100).all()
+        
+        # Convert to dicts
+        photo_dicts = []
+        for photo in photos:
+            photo_clusters = session.query(PhotoCluster).filter_by(
+                photo_id=photo.photo_id
+            ).all()
+            
+            people = []
+            for pc in photo_clusters:
+                cluster = session.query(Cluster).filter_by(
+                    cluster_id=pc.cluster_id
+                ).first()
+                if cluster:
+                    people.append(cluster.name)
+            
+            photo_dicts.append({
+                'photo_id': photo.photo_id,
+                'people': people,
+                'dominant_emotion': photo.dominant_emotion,
+                'location': photo.location_type,
+                'activity': photo.activity,
+                'season': photo.season,
+                'time_of_day': photo.time_of_day
+            })
+        
+        # Generate summary context
+        context_service = get_context_service()
+        summary = context_service.build_summary_context(
+            photo_dicts,
+            summary_type=insight_type
+        )
+        
+        # Generate insights with LLM
+        llm_service = get_llm_service()
+        insights = llm_service.generate_insight(
+            summary_context=summary,
+            insight_type=insight_type
+        )
+        
+        session.close()
+        
+        logger.info(f"✓ Generated {insight_type} insights")
+        
+        return jsonify({
+            'success': True,
+            'insight_type': insight_type,
+            'photos_analyzed': len(photo_dicts),
+            'summary': summary,
+            'insights': insights
+        })
+        
+    except Exception as e:
+        logger.error(f"Insights generation error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/llm/status', methods=['GET'])
+def llm_status():
+    """Check LLM service status"""
+    try:
+        llm_service = get_llm_service()
+        model_info = llm_service.get_model_info()
+        
+        return jsonify({
+            'success': True,
+            'model': llm_service.model,
+            'base_url': llm_service.base_url,
+            'model_info': model_info
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+# ============================================================================
+# Example: Complete chat workflow
+# ============================================================================
+"""
+USAGE EXAMPLE:
+
+1. Start new conversation:
+POST /api/conversation/new
+Response: {"conversation_id": "conv_abc123"}
+
+2. Send message:
+POST /api/chat
+{
+    "message": "Show me happy beach photos with Mom",
+    "conversation_id": "conv_abc123",
+    "top_k": 5
+}
+
+Response:
+{
+    "response": "I found 5 happy beach photos with Mom. In Photo 1...",
+    "retrieved_photos": [...],
+    "validation": {
+        "is_grounded": true,
+        "confidence": 0.95
+    }
+}
+
+3. Continue conversation:
+POST /api/chat
+{
+    "message": "When were these taken?",
+    "conversation_id": "conv_abc123"
+}
+// LLM has context from previous exchange
+
+4. Streaming chat:
+POST /api/chat/stream
+{
+    "message": "Tell me about my summer photos",
+    "conversation_id": "conv_abc123"
+}
+// Returns SSE stream of tokens
+
+5. Get insights:
+POST /api/insights
+{
+    "insight_type": "emotional"
+}
+
+Response:
+{
+    "insights": "You appear happiest in beach photos (78% happy vs 45% overall)..."
+}
+
+6. Get conversation history:
+GET /api/conversation/conv_abc123
+
+7. List all conversations:
+GET /api/conversations?limit=10
 """
 
 # ============================================================================
