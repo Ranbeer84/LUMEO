@@ -1,6 +1,21 @@
+# Environment variables
 .env
+
+# Python cache
 __pycache__/
+
+# Databases
 *.db
+
+# OS files
 .DS_Store
-backend/uploads/
+
+# ML models / large files
 *.pt
+
+# Runtime-generated data
+backend/uploads/
+
+# Backup / temporary files
+backend/app_phase1_backup.py
+backend/migrate_phase2.py
