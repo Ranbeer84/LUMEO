@@ -8,13 +8,13 @@ import numpy as np
 from datetime import datetime
 import logging
 
-# Import SQLAlchemy models (Phase 1)
+# Import SQLAlchemy models 
 from models import (
     Session, Photo, Cluster, FaceEmbedding, 
-    DetectedObject, PhotoCluster
+    DetectedObject, PhotoCluster, Conversation, Message
 )
 
-# Import vision services (Phase 2)
+# Import vision services 
 try:
     from services.pipeline_service import get_pipeline
     from services.face_service import get_face_service
@@ -27,6 +27,7 @@ try:
 
     from services.llm_service import get_llm_service
     from services.conversation_service import get_conversation_service
+    from services.memory_service import get_memory_service
     
     SERVICES_AVAILABLE = True
 except ImportError as e:
@@ -1093,7 +1094,7 @@ POST /api/query/parse
 """
 
 # ============================================================================
-# PHASE 4: CHAT / LLM ROUTES
+# CHAT / LLM ROUTES
 # ============================================================================
 
 @app.route('/api/chat', methods=['POST'])
@@ -1573,6 +1574,506 @@ GET /api/conversation/conv_abc123
 7. List all conversations:
 GET /api/conversations?limit=10
 """
+
+# ============================================================================
+# MEMORY & CONVERSATION ENHANCEMENTS
+# ============================================================================
+
+@app.route('/api/chat/enhanced', methods=['POST'])
+def enhanced_chat():
+    """
+    Enhanced chat with memory features
+    
+    Phase 5: Includes relevant memories from past conversations
+    
+    Request body:
+        {
+            "message": "Show me beach photos",
+            "conversation_id": "conv_123",
+            "use_memory": true,
+            "top_k": 5
+        }
+    """
+    if not SERVICES_AVAILABLE:
+        return jsonify({'error': 'Services not available'}), 500
+    
+    try:
+        data = request.json
+        message = data.get('message', '')
+        conversation_id = data.get('conversation_id')
+        use_memory = data.get('use_memory', True)
+        top_k = data.get('top_k', 5)
+        
+        if not message:
+            return jsonify({'error': 'Message is required'}), 400
+        
+        logger.info(f"=== ENHANCED CHAT REQUEST ===")
+        logger.info(f"Message: {message}")
+        logger.info(f"Use memory: {use_memory}")
+        
+        # Get services
+        query_service = get_query_service()
+        retrieval_service = get_retrieval_service()
+        context_service = get_context_service()
+        llm_service = get_llm_service()
+        conversation_service = get_conversation_service()
+        memory_service = get_memory_service()
+        
+        session = Session()
+        
+        # Create conversation if needed
+        if not conversation_id:
+            conversation_id = conversation_service.create_conversation(session)
+        
+        # Parse query
+        clusters = session.query(Cluster).all()
+        known_people = [c.name for c in clusters]
+        parser = get_query_parser(known_people)
+        parsed_filters = parser.parse(message)
+        
+        # Generate query embedding
+        query_embedding = query_service.encode_query(message)
+        
+        if query_embedding is None:
+            session.close()
+            return jsonify({'error': 'Failed to encode query'}), 500
+        
+        # Retrieve photos
+        db_filters = {k: v for k, v in parsed_filters.items() if k != 'raw_query'}
+        retrieved_photos = retrieval_service.hybrid_search(
+            query_embedding,
+            filters=db_filters,
+            top_k=top_k
+        )
+        
+        # Build photo context
+        photo_context = context_service.build_context(
+            retrieved_photos,
+            message,
+            include_system_prompt=False
+        )
+        
+        # PHASE 5: Add relevant memories ✨
+        memory_context = ""
+        relevant_memories = []
+        
+        if use_memory:
+            relevant_memories = memory_service.get_relevant_memories(
+                session,
+                message,
+                user_id="default_user",
+                limit=3
+            )
+            
+            if relevant_memories:
+                memory_context = memory_service.build_memory_context(relevant_memories)
+                logger.info(f"✓ Found {len(relevant_memories)} relevant memories")
+        
+        # Combine contexts
+        full_context = conversation_service.build_context_with_history(
+            session,
+            conversation_id,
+            message,
+            photo_context,
+            use_summary=True
+        )
+        
+        # Add memory context at the beginning
+        if memory_context:
+            full_context = memory_context + "\n" + full_context
+        
+        # Save user message
+        photo_ids = [p['photo_id'] for p in retrieved_photos]
+        conversation_service.add_message(
+            session,
+            conversation_id,
+            role='user',
+            content=message,
+            retrieved_photo_ids=photo_ids,
+            metadata={
+                'filters': parsed_filters,
+                'results_count': len(retrieved_photos),
+                'memories_used': len(relevant_memories)
+            }
+        )
+        
+        # Generate LLM response
+        response_text = llm_service.generate_response(
+            context=full_context,
+            query=message
+        )
+        
+        # Validate response
+        validation = llm_service.validate_response(response_text, full_context)
+        
+        # Save assistant message
+        conversation_service.add_message(
+            session,
+            conversation_id,
+            role='assistant',
+            content=response_text,
+            metadata={'validation': validation}
+        )
+        
+        # PHASE 5: Auto-summarize if needed ✨
+        summary = conversation_service.auto_summarize_if_needed(
+            session,
+            conversation_id,
+            llm_service
+        )
+        
+        session.close()
+        
+        return jsonify({
+            'success': True,
+            'conversation_id': conversation_id,
+            'response': response_text,
+            'retrieved_photos': retrieved_photos,
+            'relevant_memories': relevant_memories,
+            'validation': validation,
+            'summarized': summary is not None
+        })
+        
+    except Exception as e:
+        logger.error(f"Enhanced chat error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/conversation/<conversation_id>/summarize', methods=['POST'])
+def summarize_conversation(conversation_id):
+    """
+    Manually trigger conversation summarization
+    
+    Phase 5.3: Generate or update summary
+    """
+    if not SERVICES_AVAILABLE:
+        return jsonify({'error': 'Services not available'}), 500
+    
+    try:
+        data = request.json or {}
+        recursive = data.get('recursive', True)
+        
+        session = Session()
+        conversation_service = get_conversation_service()
+        llm_service = get_llm_service()
+        
+        summary = conversation_service.summarize_conversation(
+            session,
+            conversation_id,
+            llm_service,
+            recursive=recursive
+        )
+        
+        session.close()
+        
+        return jsonify({
+            'success': True,
+            'conversation_id': conversation_id,
+            'summary': summary
+        })
+        
+    except Exception as e:
+        logger.error(f"Summarization error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/conversation/<conversation_id>/optimize', methods=['POST'])
+def optimize_conversation(conversation_id):
+    """
+    Optimize long conversation by compressing old messages
+    
+    Phase 5: Memory optimization
+    """
+    if not SERVICES_AVAILABLE:
+        return jsonify({'error': 'Services not available'}), 500
+    
+    try:
+        data = request.json or {}
+        target_messages = data.get('target_messages', 20)
+        
+        session = Session()
+        memory_service = get_memory_service()
+        llm_service = get_llm_service()
+        
+        result = memory_service.optimize_long_conversation(
+            session,
+            conversation_id,
+            llm_service,
+            target_messages=target_messages
+        )
+        
+        session.close()
+        
+        return jsonify({
+            'success': True,
+            **result
+        })
+        
+    except Exception as e:
+        logger.error(f"Optimization error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/memory/topics', methods=['GET'])
+def get_topics():
+    """
+    Get frequently discussed topics
+    
+    Phase 5: Memory analytics
+    """
+    try:
+        limit = request.args.get('limit', 10, type=int)
+        
+        session = Session()
+        memory_service = get_memory_service()
+        
+        topics = memory_service.get_frequently_discussed_topics(
+            session,
+            limit=limit
+        )
+        
+        session.close()
+        
+        return jsonify({
+            'success': True,
+            'topics': topics
+        })
+        
+    except Exception as e:
+        logger.error(f"Topics error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/memory/timeline', methods=['GET'])
+def get_memory_timeline():
+    """
+    Get conversation timeline
+    
+    Phase 5: Memory visualization
+    """
+    try:
+        days = request.args.get('days', 30, type=int)
+        
+        session = Session()
+        memory_service = get_memory_service()
+        
+        timeline = memory_service.get_conversation_timeline(
+            session,
+            days=days
+        )
+        
+        session.close()
+        
+        return jsonify({
+            'success': True,
+            'timeline': timeline,
+            'days': days
+        })
+        
+    except Exception as e:
+        logger.error(f"Timeline error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/photo/<photo_id>/history', methods=['GET'])
+def get_photo_history(photo_id):
+    """
+    Get interaction history for a specific photo
+    
+    Phase 5: Photo-level memory
+    """
+    try:
+        session = Session()
+        memory_service = get_memory_service()
+        
+        history = memory_service.get_photo_interaction_history(
+            session,
+            photo_id
+        )
+        
+        session.close()
+        
+        return jsonify({
+            'success': True,
+            'photo_id': photo_id,
+            'interactions': history,
+            'interaction_count': len(history)
+        })
+        
+    except Exception as e:
+        logger.error(f"Photo history error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/conversations/search', methods=['POST'])
+def search_conversations():
+    """
+    Search conversations by content
+    
+    Phase 5: Memory search
+    """
+    try:
+        data = request.json
+        query = data.get('query', '')
+        limit = data.get('limit', 10)
+        
+        if not query:
+            return jsonify({'error': 'Query is required'}), 400
+        
+        session = Session()
+        conversation_service = get_conversation_service()
+        
+        results = conversation_service.search_conversations(
+            session,
+            query,
+            limit=limit
+        )
+        
+        session.close()
+        
+        return jsonify({
+            'success': True,
+            'query': query,
+            'results': results,
+            'count': len(results)
+        })
+        
+    except Exception as e:
+        logger.error(f"Search error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/conversation/<conversation_id>/export', methods=['GET'])
+def export_conversation(conversation_id):
+    """
+    Export conversation as JSON or markdown
+    
+    Phase 5: Data export
+    """
+    try:
+        format_type = request.args.get('format', 'json')
+        
+        session = Session()
+        conversation_service = get_conversation_service()
+        
+        # Get conversation
+        from models import Conversation
+        conversation = session.query(Conversation).filter_by(
+            conversation_id=conversation_id
+        ).first()
+        
+        if not conversation:
+            session.close()
+            return jsonify({'error': 'Conversation not found'}), 404
+        
+        # Get history
+        history = conversation_service.get_conversation_history(
+            session,
+            conversation_id
+        )
+        
+        session.close()
+        
+        if format_type == 'markdown':
+            # Export as markdown
+            md_lines = [
+                f"# Conversation {conversation_id}",
+                f"Created: {datetime.fromtimestamp(conversation.created_at).strftime('%Y-%m-%d %H:%M')}",
+                f"Messages: {len(history)}",
+                ""
+            ]
+            
+            if conversation.summary:
+                md_lines.extend([
+                    "## Summary",
+                    conversation.summary,
+                    ""
+                ])
+            
+            md_lines.append("## Messages")
+            md_lines.append("")
+            
+            for msg in history:
+                role = msg['role'].upper()
+                content = msg['content']
+                timestamp = datetime.fromtimestamp(msg['created_at']).strftime('%Y-%m-%d %H:%M')
+                
+                md_lines.append(f"### {role} ({timestamp})")
+                md_lines.append(content)
+                md_lines.append("")
+            
+            return Response(
+                '\n'.join(md_lines),
+                mimetype='text/markdown',
+                headers={'Content-Disposition': f'attachment; filename=conversation_{conversation_id}.md'}
+            )
+        
+        else:
+            # Export as JSON
+            export_data = {
+                'conversation_id': conversation_id,
+                'created_at': conversation.created_at,
+                'updated_at': conversation.updated_at,
+                'message_count': len(history),
+                'summary': conversation.summary,
+                'messages': history
+            }
+            
+            return jsonify(export_data)
+        
+    except Exception as e:
+        logger.error(f"Export error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================================
+# Example Usage
+# ============================================================================
+"""
+PHASE 5 USAGE EXAMPLES:
+
+1. Enhanced chat with memory:
+POST /api/chat/enhanced
+{
+    "message": "Show me beach photos",
+    "conversation_id": "conv_123",
+    "use_memory": true
+}
+
+2. Manual summarization:
+POST /api/conversation/conv_123/summarize
+{
+    "recursive": true
+}
+
+3. Optimize long conversation:
+POST /api/conversation/conv_123/optimize
+{
+    "target_messages": 20
+}
+
+4. Get frequently discussed topics:
+GET /api/memory/topics?limit=10
+
+5. Get conversation timeline:
+GET /api/memory/timeline?days=30
+
+6. Get photo interaction history:
+GET /api/photo/photo_123/history
+
+7. Search conversations:
+POST /api/conversations/search
+{
+    "query": "beach vacation",
+    "limit": 10
+}
+
+8. Export conversation:
+GET /api/conversation/conv_123/export?format=markdown
+"""
+
 
 # ============================================================================
 # MAIN
