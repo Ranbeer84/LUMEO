@@ -293,7 +293,12 @@ class MetadataService:
                 caption_parts.append(f"during {metadata['time_of_day']}")
         
         # Season
-        if metadata.get('season') != 'unknown':
+        # if metadata.get('season') != 'unknown': # <--- TRAP HERE
+        #     caption_parts.append(f"in {metadata['season']}") # <--- CRASH HERE
+
+        # Season
+        # Check if metadata exists, AND if 'season' is a key, AND if it has a value
+        if metadata and 'season' in metadata and metadata['season'] and metadata['season'] != 'unknown':
             caption_parts.append(f"in {metadata['season']}")
         
         # Scene
