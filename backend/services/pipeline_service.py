@@ -50,9 +50,24 @@ class AnalysisPipeline:
         }
         
         try:
+            # # Step 1: Extract Metadata (2-3 seconds)
+            # self._progress(progress_callback, 1, "Extracting metadata...")
+            # metadata = self.metadata_service.extract_exif(photo_path)
+            # results['metadata'] = metadata
+            # logger.info(f"✓ Metadata extracted: {metadata.get('date_taken', 'No date')}")
+
             # Step 1: Extract Metadata (2-3 seconds)
             self._progress(progress_callback, 1, "Extracting metadata...")
             metadata = self.metadata_service.extract_exif(photo_path)
+            
+            # --- SAFETY NET ---
+            if metadata is None:
+                metadata = {}
+                
+            # Force 'season' to exist so Step 8 doesn't crash
+            if 'season' not in metadata:
+                metadata['season'] = 'unknown'
+
             results['metadata'] = metadata
             logger.info(f"✓ Metadata extracted: {metadata.get('date_taken', 'No date')}")
             
@@ -126,11 +141,11 @@ class AnalysisPipeline:
             else:
                 results['clip_embedding'] = None
                 logger.warning("× CLIP embedding failed")
-            
-            # Step 8: Generate Caption (< 1 second)
+
+            # Step 8: Generate Caption
             self._progress(progress_callback, 7, "Generating caption...")
             caption = self.metadata_service.generate_caption(
-                metadata=metadata,
+                metadata=metadata,  # This is now safe because of Step 1
                 detected_objects=detected_objects,
                 detected_faces=len(face_encodings),
                 emotion=results['photo_emotion'].get('dominant_emotion')
