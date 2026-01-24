@@ -188,14 +188,7 @@ def process_photos():
     """
     Process photos through vision pipeline and face clustering
     
-    Phase 2 Enhanced:
-    - Face detection with quality scores
-    - Emotion detection per face
-    - Object detection with YOLO
-    - Scene classification
-    - CLIP embeddings
-    - Metadata extraction
-    - Face clustering with emotions
+    FIXED: Prevents duplicate photo_cluster entries
     """
     if not SERVICES_AVAILABLE:
         return jsonify({
@@ -256,7 +249,6 @@ def process_photos():
                 
                 # CLIP embedding (for semantic search in Phase 3)
                 if result.get('clip_embedding'):
-                    # Convert list back to numpy array for pgvector
                     photo.clip_embedding = result['clip_embedding']
                 
                 # Scene classification
@@ -404,6 +396,10 @@ def process_photos():
                 cluster.face_count = len(data['faces'])
                 cluster.thumbnail = thumbnail_filename
             
+            # FIX: Track which photo-cluster combinations we've already added
+            # to prevent duplicate key errors
+            added_photo_clusters = set()
+            
             # Save face embeddings with emotion and quality
             for face_data in data['faces']:
                 face_embedding = FaceEmbedding(
@@ -418,12 +414,24 @@ def process_photos():
                 )
                 session.add(face_embedding)
                 
-                # Link photo to cluster (many-to-many)
-                photo_cluster = PhotoCluster(
-                    photo_id=face_data['photo_id'],
-                    cluster_id=cluster_id
-                )
-                session.add(photo_cluster)
+                # FIX: Only add photo-cluster link if we haven't already added it
+                # This prevents duplicates when a photo has multiple faces of the same person
+                photo_cluster_key = (face_data['photo_id'], cluster_id)
+                if photo_cluster_key not in added_photo_clusters:
+                    # Check if it already exists in database
+                    existing = session.query(PhotoCluster).filter_by(
+                        photo_id=face_data['photo_id'],
+                        cluster_id=cluster_id
+                    ).first()
+                    
+                    if not existing:
+                        photo_cluster = PhotoCluster(
+                            photo_id=face_data['photo_id'],
+                            cluster_id=cluster_id
+                        )
+                        session.add(photo_cluster)
+                    
+                    added_photo_clusters.add(photo_cluster_key)
         
         session.commit()
         logger.info(f"✓ Saved all clusters and face embeddings")
@@ -1098,25 +1106,16 @@ POST /api/query/parse
 # ============================================================================
 
 @app.route('/api/chat', methods=['POST'])
-def chat():
+def chat(custom_data=None):
     """
-    Send a message and get LLM response
-    
-    Request body:
-        {
-            "message": "Show me happy beach photos",
-            "conversation_id": "conv_abc123",  // optional
-            "top_k": 5,
-            "stream": false
-        }
-    
-    Returns: LLM response with retrieved photos
+    Unified Endpoint: Handles both Standard and Streaming requests.
     """
     if not SERVICES_AVAILABLE:
         return jsonify({'error': 'Services not available'}), 500
     
     try:
-        data = request.json
+        # 1. Setup Data
+        data = custom_data if custom_data else request.json
         message = data.get('message', '')
         conversation_id = data.get('conversation_id')
         top_k = data.get('top_k', 5)
@@ -1129,7 +1128,7 @@ def chat():
         logger.info(f"Message: {message}")
         logger.info(f"Conversation: {conversation_id}")
         
-        # Get services
+        # 2. Get Services & Session
         query_service = get_query_service()
         retrieval_service = get_retrieval_service()
         context_service = get_context_service()
@@ -1137,101 +1136,91 @@ def chat():
         conversation_service = get_conversation_service()
         
         session = Session()
-        
-        # Create new conversation if needed
+
+        # 3. FIXED: Handle conversation ID properly
         if not conversation_id:
+            # Create new random ID
             conversation_id = conversation_service.create_conversation(session)
             logger.info(f"Created new conversation: {conversation_id}")
+        elif conversation_id == 'default':
+            # Check if default exists, create if not
+            from models import Conversation
+            existing = session.query(Conversation).filter_by(conversation_id='default').first()
+            if not existing:
+                # Manually create the 'default' conversation
+                default_conversation = Conversation(
+                    conversation_id='default',
+                    created_at=time.time(),
+                    updated_at=time.time()
+                )
+                session.add(default_conversation)
+                session.commit()
+                logger.info("Created default conversation")
         
-        # Parse query
+        # 4. Parse query
         clusters = session.query(Cluster).all()
         known_people = [c.name for c in clusters]
         
         parser = get_query_parser(known_people)
         parsed_filters = parser.parse(message)
         
-        # Generate query embedding
-        query_embedding = query_service.encode_query(message)
+        logger.info(f"Parsed filters: {parsed_filters}")
         
+        # 5. Generate query embedding
+        query_embedding = query_service.encode_query(message)
         if query_embedding is None:
             session.close()
             return jsonify({'error': 'Failed to encode query'}), 500
         
-        # Retrieve photos
+        # 6. Retrieve photos
         db_filters = {k: v for k, v in parsed_filters.items() if k != 'raw_query'}
         retrieved_photos = retrieval_service.hybrid_search(
-            query_embedding,
-            filters=db_filters,
-            top_k=top_k
+            query_embedding, filters=db_filters, top_k=top_k
         )
         
         logger.info(f"✓ Retrieved {len(retrieved_photos)} photos")
         
-        # Build context
+        # 7. Build context
         photo_context = context_service.build_context(
-            retrieved_photos,
-            message,
-            include_system_prompt=False  # We'll add it in LLM service
+            retrieved_photos, message, include_system_prompt=False
         )
         
-        # Include conversation history
+        # 8. Include conversation history
         full_context = conversation_service.build_context_with_history(
-            session,
-            conversation_id,
-            message,
-            photo_context
+            session, conversation_id, message, photo_context
         )
         
-        # Save user message
+        # 9. Save user message
         photo_ids = [p['photo_id'] for p in retrieved_photos]
         conversation_service.add_message(
-            session,
-            conversation_id,
-            role='user',
-            content=message,
+            session, conversation_id, role='user', content=message,
             retrieved_photo_ids=photo_ids,
-            metadata={
-                'filters': parsed_filters,
-                'results_count': len(retrieved_photos)
-            }
+            metadata={'filters': parsed_filters, 'results_count': len(retrieved_photos)}
         )
-        
-        # Generate LLM response
+
+        # 10. CRITICAL: Commit before streaming to save user message
+        session.commit()
+
+        # 11. Generate Response (Stream or Standard)
         if use_streaming:
-            # Return streaming response
-            session.close()
+            session.close()  # Safe to close now because we committed above
             return Response(
                 stream_chat_response(
-                    llm_service,
-                    conversation_service,
-                    conversation_id,
-                    full_context,
-                    message,
-                    retrieved_photos
+                    llm_service, conversation_service, conversation_id,
+                    full_context, message, retrieved_photos
                 ),
                 mimetype='text/event-stream'
             )
         else:
-            # Generate complete response
-            response_text = llm_service.generate_response(
-                context=full_context,
-                query=message
-            )
-            
-            # Validate response
+            # Standard (non-streaming) response
+            response_text = llm_service.generate_response(context=full_context, query=message)
             validation = llm_service.validate_response(response_text, full_context)
             
-            # Save assistant message
             conversation_service.add_message(
-                session,
-                conversation_id,
-                role='assistant',
-                content=response_text,
-                metadata={
-                    'validation': validation
-                }
+                session, conversation_id, role='assistant', content=response_text,
+                metadata={'validation': validation}
             )
-            
+            session.commit()
             session.close()
             
             logger.info(f"✓ Generated response ({len(response_text)} chars)")
@@ -1244,7 +1233,7 @@ def chat():
                 'retrieved_photos': retrieved_photos,
                 'validation': validation
             })
-        
+
     except Exception as e:
         logger.error(f"Chat error: {str(e)}")
         import traceback
@@ -1294,10 +1283,14 @@ def chat_stream():
     """
     Streaming chat endpoint (alias for chat with stream=true)
     """
-    data = request.json or {}
+    # Get the data normally
+    data = request.get_json() or {}
+    
+    # Force stream to True
     data['stream'] = True
-    request.json = data
-    return chat()
+    
+    # Pass the data directly to the updated chat function
+    return chat(custom_data=data)
 
 
 @app.route('/api/conversations', methods=['GET'])
