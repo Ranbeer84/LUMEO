@@ -9,12 +9,13 @@ import ChatPanel from "./components/ChatPanel";
 import PhotoCanvas from "./components/PhotoCanvas";
 import ClusterModal from "./components/modals/ClusterModal";
 import PhotoModal from "./components/modals/PhotoModal";
+import ClusterManager from "./components/ClusterManager";
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 function App() {
   // ── App routing ────────────────────────────────────────────────────────────
-  const [appMode, setAppMode] = useState("home"); // 'home' | 'organize' | 'chat'
+  const [appMode, setAppMode] = useState("home"); // 'home' | 'organize' | 'chat' | 'clusters'
   const [hasPhotos, setHasPhotos] = useState(false);
 
   // ── Organize flow ──────────────────────────────────────────────────────────
@@ -340,6 +341,9 @@ function App() {
           setAppMode={setAppMode}
         />
       )}
+      
+      {/* ── Clusters ─────────────────────────────────────────────────────── */}
+      {appMode === "clusters" && <ClusterManager setAppMode={setAppMode} />}
 
       {/* ── Chat ─────────────────────────────────────────────────────────── */}
       {appMode === "chat" && (
