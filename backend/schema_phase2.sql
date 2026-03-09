@@ -1,6 +1,11 @@
 -- Phase 2 Schema Enhancements
 -- Add new columns and tables for advanced vision features
 
+-- 0. Add missing columns to clusters table (required by triggers in schema.sql)
+ALTER TABLE clusters
+ADD COLUMN IF NOT EXISTS photo_count INTEGER DEFAULT 0,
+ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+
 -- 1. Add emotion and quality columns to face_embeddings
 ALTER TABLE face_embeddings 
 ADD COLUMN IF NOT EXISTS emotion VARCHAR(20),
