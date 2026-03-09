@@ -1,4 +1,11 @@
-import { Camera, MessageSquare, Upload, ChevronRight, Sparkles } from "lucide-react";
+import {
+  Camera,
+  MessageSquare,
+  Upload,
+  ChevronRight,
+  Sparkles,
+  Users,
+} from "lucide-react";
 
 /**
  * HomeMode
@@ -12,7 +19,9 @@ import { Camera, MessageSquare, Upload, ChevronRight, Sparkles } from "lucide-re
 const HomeMode = ({ hasPhotos, setAppMode, resetApp }) => (
   <div style={{ maxWidth: "1000px", margin: "0 auto" }}>
     {/* Header */}
-    <div style={{ textAlign: "center", marginBottom: "48px", marginTop: "40px" }}>
+    <div
+      style={{ textAlign: "center", marginBottom: "48px", marginTop: "40px" }}
+    >
       <div
         style={{
           display: "inline-flex",
@@ -53,7 +62,9 @@ const HomeMode = ({ hasPhotos, setAppMode, resetApp }) => (
       {/* Chat card */}
       <div
         onClick={() =>
-          hasPhotos ? setAppMode("chat") : alert("Please organize photos first!")
+          hasPhotos
+            ? setAppMode("chat")
+            : alert("Please organize photos first!")
         }
         className="glass-card"
         style={{
@@ -66,7 +77,9 @@ const HomeMode = ({ hasPhotos, setAppMode, resetApp }) => (
         onMouseEnter={(e) =>
           hasPhotos && (e.currentTarget.style.transform = "translateY(-4px)")
         }
-        onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0)")}
+        onMouseLeave={(e) =>
+          (e.currentTarget.style.transform = "translateY(0)")
+        }
       >
         <div
           style={{
@@ -83,12 +96,21 @@ const HomeMode = ({ hasPhotos, setAppMode, resetApp }) => (
         >
           <MessageSquare size={36} color="#93c5fd" strokeWidth={1.5} />
         </div>
-        <h2 style={{ fontSize: "24px", marginBottom: "12px", fontWeight: "600" }}>
+        <h2
+          style={{ fontSize: "24px", marginBottom: "12px", fontWeight: "600" }}
+        >
           Chat with Photos
         </h2>
-        <p style={{ color: "rgba(255,255,255,0.6)", fontSize: "14px", lineHeight: "1.6", marginBottom: "20px" }}>
-          Search your photo library with natural language. Ask questions like "Show
-          me beach photos" or "When was I last with Mom?"
+        <p
+          style={{
+            color: "rgba(255,255,255,0.6)",
+            fontSize: "14px",
+            lineHeight: "1.6",
+            marginBottom: "20px",
+          }}
+        >
+          Search your photo library with natural language. Ask questions like
+          "Show me beach photos" or "When was I last with Mom?"
         </p>
         {hasPhotos ? (
           <div
@@ -104,7 +126,13 @@ const HomeMode = ({ hasPhotos, setAppMode, resetApp }) => (
             Start Chatting <ChevronRight size={16} />
           </div>
         ) : (
-          <div style={{ fontSize: "12px", color: "rgba(255,255,255,0.4)", fontStyle: "italic" }}>
+          <div
+            style={{
+              fontSize: "12px",
+              color: "rgba(255,255,255,0.4)",
+              fontStyle: "italic",
+            }}
+          >
             No photos organized yet
           </div>
         )}
@@ -114,9 +142,18 @@ const HomeMode = ({ hasPhotos, setAppMode, resetApp }) => (
       <div
         onClick={() => setAppMode("organize")}
         className="glass-card"
-        style={{ borderRadius: "24px", padding: "40px", cursor: "pointer", transition: "all 0.3s" }}
-        onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(-4px)")}
-        onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0)")}
+        style={{
+          borderRadius: "24px",
+          padding: "40px",
+          cursor: "pointer",
+          transition: "all 0.3s",
+        }}
+        onMouseEnter={(e) =>
+          (e.currentTarget.style.transform = "translateY(-4px)")
+        }
+        onMouseLeave={(e) =>
+          (e.currentTarget.style.transform = "translateY(0)")
+        }
       >
         <div
           style={{
@@ -133,10 +170,19 @@ const HomeMode = ({ hasPhotos, setAppMode, resetApp }) => (
         >
           <Upload size={36} color="#4ade80" strokeWidth={1.5} />
         </div>
-        <h2 style={{ fontSize: "24px", marginBottom: "12px", fontWeight: "600" }}>
+        <h2
+          style={{ fontSize: "24px", marginBottom: "12px", fontWeight: "600" }}
+        >
           Organize Photos
         </h2>
-        <p style={{ color: "rgba(255,255,255,0.6)", fontSize: "14px", lineHeight: "1.6", marginBottom: "20px" }}>
+        <p
+          style={{
+            color: "rgba(255,255,255,0.6)",
+            fontSize: "14px",
+            lineHeight: "1.6",
+            marginBottom: "20px",
+          }}
+        >
           Upload new photos and let AI detect faces, group people, and organize
           your memories automatically.
         </p>
@@ -152,6 +198,63 @@ const HomeMode = ({ hasPhotos, setAppMode, resetApp }) => (
         >
           Get Started <ChevronRight size={16} />
         </div>
+      </div>
+    </div>
+    {/* Manage Clusters card */}
+    <div
+      onClick={() => setAppMode("clusters")}
+      className="glass-card"
+      style={{
+        borderRadius: "24px",
+        padding: "40px",
+        cursor: "pointer",
+        transition: "all 0.3s",
+      }}
+      onMouseEnter={(e) =>
+        (e.currentTarget.style.transform = "translateY(-4px)")
+      }
+      onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0)")}
+    >
+      <div
+        style={{
+          width: "72px",
+          height: "72px",
+          borderRadius: "20px",
+          background: "rgba(251, 191, 36, 0.15)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          marginBottom: "24px",
+          border: "1px solid rgba(251, 191, 36, 0.3)",
+        }}
+      >
+        <Users size={36} color="#fbbf24" strokeWidth={1.5} />
+      </div>
+      <h2 style={{ fontSize: "24px", marginBottom: "12px", fontWeight: "600" }}>
+        Manage Clusters
+      </h2>
+      <p
+        style={{
+          color: "rgba(255,255,255,0.6)",
+          fontSize: "14px",
+          lineHeight: "1.6",
+          marginBottom: "20px",
+        }}
+      >
+        Rename people, merge duplicate face groups, or remove misclassified
+        photos from any cluster.
+      </p>
+      <div
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: "8px",
+          color: "#fbbf24",
+          fontSize: "13px",
+          fontWeight: "500",
+        }}
+      >
+        Open Manager <ChevronRight size={16} />
       </div>
     </div>
 
