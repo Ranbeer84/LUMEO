@@ -605,6 +605,150 @@ def rename_cluster():
         session.close()
         logger.error(f"Error renaming cluster: {str(e)}")
         return jsonify({'error': str(e)}), 500
+    
+@app.route('/api/clusters/merge', methods=['POST'])
+def merge_clusters():
+    """
+    Merge source cluster INTO target cluster.
+    All faces and photos from source are moved to target, then source is deleted.
+    
+    Body: { "source_cluster_id": "cluster_2", "target_cluster_id": "cluster_0" }
+    """
+    data = request.json
+    source_id = data.get('source_cluster_id')
+    target_id = data.get('target_cluster_id')
+
+    if not source_id or not target_id:
+        return jsonify({'error': 'Missing source_cluster_id or target_cluster_id'}), 400
+    if source_id == target_id:
+        return jsonify({'error': 'Source and target cannot be the same'}), 400
+
+    session = Session()
+    try:
+        source = session.query(Cluster).filter_by(cluster_id=source_id).first()
+        target = session.query(Cluster).filter_by(cluster_id=target_id).first()
+
+        if not source or not target:
+            session.close()
+            return jsonify({'error': 'Cluster not found'}), 404
+
+        # 1. Re-point all FaceEmbeddings from source → target
+        session.query(FaceEmbedding).filter_by(cluster_id=source_id).update(
+            {'cluster_id': target_id}
+        )
+
+        # 2. Move PhotoCluster links, skip duplicates
+        source_links = session.query(PhotoCluster).filter_by(cluster_id=source_id).all()
+        for link in source_links:
+            already_exists = session.query(PhotoCluster).filter_by(
+                photo_id=link.photo_id,
+                cluster_id=target_id
+            ).first()
+            if not already_exists:
+                new_link = PhotoCluster(photo_id=link.photo_id, cluster_id=target_id)
+                session.add(new_link)
+            session.delete(link)
+
+        # 3. Update target face count
+        new_face_count = session.query(FaceEmbedding).filter_by(cluster_id=target_id).count()
+        new_photo_count = session.query(PhotoCluster).filter_by(cluster_id=target_id).count()
+        target.face_count = new_face_count
+        target.photo_count = new_photo_count
+        target.updated_at = datetime.utcnow()
+
+        # 4. Delete source cluster
+        session.delete(source)
+        session.commit()
+
+        logger.info(f"✓ Merged cluster {source_id} into {target_id}")
+        return jsonify({'success': True, 'merged_into': target_id})
+
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Merge error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+@app.route('/api/clusters/<cluster_id>', methods=['DELETE'])
+def delete_cluster(cluster_id):
+    """
+    Delete a cluster and all its face embeddings and photo links.
+    Does NOT delete the photos themselves.
+    """
+    session = Session()
+    try:
+        cluster = session.query(Cluster).filter_by(cluster_id=cluster_id).first()
+        if not cluster:
+            session.close()
+            return jsonify({'error': 'Cluster not found'}), 404
+
+        # Cascade handles FaceEmbedding + PhotoCluster deletions
+        session.delete(cluster)
+
+        # Also delete thumbnail file if it exists
+        if cluster.thumbnail:
+            thumb_path = os.path.join(THUMBNAILS_FOLDER, cluster.thumbnail)
+            if os.path.exists(thumb_path):
+                os.remove(thumb_path)
+
+        session.commit()
+        logger.info(f"✓ Deleted cluster {cluster_id}")
+        return jsonify({'success': True})
+
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Delete cluster error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+@app.route('/api/clusters/<cluster_id>/photos/<photo_id>', methods=['DELETE'])
+def remove_photo_from_cluster(cluster_id, photo_id):
+    """
+    Remove a single photo from a cluster.
+    Deletes the PhotoCluster link and all FaceEmbeddings for this photo+cluster pair.
+    Does NOT delete the photo itself.
+    """
+    session = Session()
+    try:
+        # Delete the junction row
+        link = session.query(PhotoCluster).filter_by(
+            cluster_id=cluster_id, photo_id=photo_id
+        ).first()
+        if not link:
+            session.close()
+            return jsonify({'error': 'Photo not in this cluster'}), 404
+        session.delete(link)
+
+        # Delete face embeddings for this photo in this cluster
+        session.query(FaceEmbedding).filter_by(
+            cluster_id=cluster_id, photo_id=photo_id
+        ).delete()
+
+        # Update cluster face/photo count
+        cluster = session.query(Cluster).filter_by(cluster_id=cluster_id).first()
+        if cluster:
+            cluster.face_count = session.query(FaceEmbedding).filter_by(
+                cluster_id=cluster_id
+            ).count()
+            cluster.photo_count = session.query(PhotoCluster).filter_by(
+                cluster_id=cluster_id
+            ).count()
+            cluster.updated_at = datetime.utcnow()
+
+        session.commit()
+        logger.info(f"✓ Removed photo {photo_id} from cluster {cluster_id}")
+        return jsonify({'success': True})
+
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Remove photo error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
 
 @app.route('/api/organize', methods=['POST'])
 def organize_photos():
