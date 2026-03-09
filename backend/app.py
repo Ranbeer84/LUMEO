@@ -389,7 +389,7 @@ def process_photos():
                     name=f"Person {cluster_id.split('_')[1]}",
                     face_count=len(data['faces']),
                     thumbnail=thumbnail_filename,
-                    created_at=time.time()
+                    created_at=datetime.utcnow()    # ← matches DateTime column
                 )
                 session.add(cluster)
             else:
@@ -453,7 +453,8 @@ def process_photos():
                     photos_in_cluster.append({
                         'photo_id': p.photo_id,
                         'filename': p.filename,
-                        'path': p.filename  # Frontend expects filename
+                        # 'path': p.filename  # Frontend expects filename
+                        'path': f'uploads/{p.filename}'
                     })
             
             cluster_info.append({
@@ -509,7 +510,8 @@ def get_clusters():
                     photos.append({
                         'photo_id': photo.photo_id,
                         'filename': photo.filename,
-                        'path': photo.filename
+                        # 'path': photo.filename 
+                        'path': f'uploads/{photo.filename}'
                     })
             
             cluster_list.append({
@@ -553,7 +555,8 @@ def get_cluster_photos(cluster_id):
                 photos.append({
                     'photo_id': photo.photo_id,
                     'filename': photo.filename,
-                    'path': photo.filename
+                    # 'path': photo.filename
+                    'path': f'uploads/{photo.filename}'
                 })
         
         session.close()
@@ -1241,26 +1244,32 @@ def chat(custom_data=None):
         return jsonify({'error': str(e)}), 500
 
 
+"""
+
+FIX: Added session.commit() before session.close().
+     Without it, the assistant message was added to the session but never
+     persisted; the DB row was silently discarded on close().
+"""
+
 def stream_chat_response(llm_service, conversation_service, conversation_id, context, query, retrieved_photos):
     """
-    Generator for streaming chat responses
-    
-    Yields Server-Sent Events (SSE) format
+    Generator for streaming chat responses.
+    Yields Server-Sent Events (SSE) format.
     """
     full_response = []
-    
+
     try:
         # First, send retrieved photos
         yield f"data: {json.dumps({'type': 'photos', 'photos': retrieved_photos})}\n\n"
-        
-        # Then stream LLM response
+
+        # Stream LLM response token by token
         for chunk in llm_service.generate_streaming_response(context, query):
             full_response.append(chunk)
             yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
-        
-        # Save complete response
+
+        # Persist the complete assistant response
         response_text = ''.join(full_response)
-        
+
         session = Session()
         conversation_service.add_message(
             session,
@@ -1268,15 +1277,14 @@ def stream_chat_response(llm_service, conversation_service, conversation_id, con
             role='assistant',
             content=response_text
         )
+        session.commit()   # FIX: was missing — message was never persisted
         session.close()
-        
-        # Send completion event
+
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
-        
+
     except Exception as e:
         logger.error(f"Streaming error: {str(e)}")
         yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
-
 
 @app.route('/api/chat/stream', methods=['POST'])
 def chat_stream():
