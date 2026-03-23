@@ -119,6 +119,10 @@ class AnalysisPipeline:
             results['object_count'] = len(detected_objects)
             
             logger.info(f"✓ Detected {len(detected_objects)} objects")
+
+            scene_weather = self.object_service.detect_scene_and_weather(photo_path, detected_objects)
+            results['weather'] = scene_weather['weather']
+            results['scene_label'] = scene_weather['scene_label']
             
             # Step 5: Classify Scene (< 1 second)
             self._progress(progress_callback, 5, "Classifying scene...")
