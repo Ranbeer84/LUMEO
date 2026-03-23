@@ -19,6 +19,7 @@ ADD COLUMN IF NOT EXISTS clip_embedding vector(512),
 ADD COLUMN IF NOT EXISTS scene_type VARCHAR(20),
 ADD COLUMN IF NOT EXISTS location_type VARCHAR(50),
 ADD COLUMN IF NOT EXISTS activity VARCHAR(50),
+ADD COLUMN IF NOT EXISTS weather VARCHAR(50),
 ADD COLUMN IF NOT EXISTS season VARCHAR(20),
 ADD COLUMN IF NOT EXISTS time_of_day VARCHAR(20),
 ADD COLUMN IF NOT EXISTS date_taken TIMESTAMP,
@@ -76,6 +77,7 @@ COMMENT ON COLUMN photos.clip_embedding IS 'CLIP image embedding for semantic se
 COMMENT ON COLUMN photos.scene_type IS 'Indoor/outdoor classification';
 COMMENT ON COLUMN photos.location_type IS 'Specific location (beach, office, home, etc.)';
 COMMENT ON COLUMN photos.activity IS 'Activity detected (sports, dining, party, etc.)';
+COMMENT ON COLUMN photos.weather IS 'Weather condition detected (sunny, cloudy, rainy, etc.)';
 COMMENT ON COLUMN photos.caption IS 'Auto-generated natural language caption';
 COMMENT ON COLUMN photos.mood_score IS 'Overall mood score from -1 (negative) to +1 (positive)';
 COMMENT ON TABLE detected_objects IS 'Objects detected by YOLO in photos';
