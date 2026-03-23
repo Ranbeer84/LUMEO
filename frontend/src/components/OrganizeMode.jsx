@@ -401,13 +401,14 @@ const OrganizeMode = ({
           alignItems: "center",
           gap: "8px",
           fontSize: "14px",
+          color: "rgba(255,255,255,0.6)",
         }}
       >
         <ChevronLeft size={16} /> Back to Home
       </button>
 
       {/* Page title */}
-      <div style={{ textAlign: "center", marginBottom: "32px" }}>
+      {/* <div style={{ textAlign: "center", marginBottom: "32px" }}>
         <div
           style={{
             display: "inline-flex",
@@ -434,6 +435,170 @@ const OrganizeMode = ({
         <p style={{ fontSize: "14px", color: "rgba(255,255,255,0.6)" }}>
           AI-powered face recognition & organization
         </p>
+      </div> */}
+      {/* Page title */}
+      <div
+        style={{
+          textAlign: "center",
+          marginBottom: "40px",
+          position: "relative",
+        }}
+      >
+        {/* Ambient glow behind title */}
+        <div
+          style={{
+            position: "absolute",
+            top: "50%",
+            left: "50%",
+            transform: "translate(-50%, -50%)",
+            width: "320px",
+            height: "80px",
+            background:
+              "radial-gradient(ellipse, rgba(147, 197, 253, 0.15) 0%, transparent 70%)",
+            pointerEvents: "none",
+            filter: "blur(20px)",
+          }}
+        />
+
+        {/* AI badge pill */}
+        <div
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "6px",
+            padding: "5px 14px",
+            borderRadius: "999px",
+            background: "rgba(147, 197, 253, 0.08)",
+            border: "1px solid rgba(147, 197, 253, 0.25)",
+            marginBottom: "16px",
+            fontSize: "11px",
+            fontWeight: "600",
+            letterSpacing: "0.1em",
+            textTransform: "uppercase",
+            color: "#93c5fd",
+          }}
+        >
+          <span
+            style={{
+              width: "6px",
+              height: "6px",
+              borderRadius: "50%",
+              background: "#93c5fd",
+              boxShadow: "0 0 6px #93c5fd",
+              animation: "pulse 2s ease-in-out infinite",
+            }}
+          />
+          Lumeo
+        </div>
+
+        {/* Main title row */}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: "16px",
+            marginBottom: "14px",
+            animation: "float 3s ease-in-out infinite",
+          }}
+        >
+          {/* Icon container with layered rings */}
+          <div style={{ position: "relative", flexShrink: 0 }}>
+            <div
+              style={{
+                position: "absolute",
+                inset: "-8px",
+                borderRadius: "50%",
+                border: "1px solid rgba(147, 197, 253, 0.15)",
+                animation: "spin 8s linear infinite",
+              }}
+            />
+            <div
+              style={{
+                position: "absolute",
+                inset: "-4px",
+                borderRadius: "50%",
+                border: "1px dashed rgba(147, 197, 253, 0.2)",
+                animation: "spin 5s linear infinite reverse",
+              }}
+            />
+            <div
+              style={{
+                width: "52px",
+                height: "52px",
+                borderRadius: "16px",
+                background:
+                  "linear-gradient(135deg, rgba(147, 197, 253, 0.15), rgba(147, 197, 253, 0.05))",
+                border: "1px solid rgba(147, 197, 253, 0.3)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                boxShadow:
+                  "0 0 24px rgba(147, 197, 253, 0.1), inset 0 1px 0 rgba(255,255,255,0.1)",
+              }}
+            >
+              <Camera
+                size={26}
+                strokeWidth={1.5}
+                style={{ color: "#93c5fd" }}
+              />
+            </div>
+          </div>
+
+          {/* Title text */}
+          <div>
+            <h1
+              style={{
+                fontSize: "clamp(28px, 6vw, 42px)",
+                fontWeight: "700",
+                margin: 0,
+                lineHeight: 1.1,
+                letterSpacing: "-0.02em",
+                background:
+                  "linear-gradient(135deg, #ffffff 0%, #bfdbfe 50%, #93c5fd 100%)",
+                WebkitBackgroundClip: "text",
+                WebkitTextFillColor: "transparent",
+              }}
+            >
+              Photo Organizer
+            </h1>
+          </div>
+        </div>
+
+        {/* Subtitle with decorative lines */}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: "12px",
+          }}
+        >
+          <div
+            style={{
+              width: "40px",
+              height: "1px",
+              background: "rgba(255,255,255,0.1)",
+            }}
+          />
+          <p
+            style={{
+              fontSize: "13px",
+              color: "rgba(255,255,255,0.45)",
+              margin: 0,
+              letterSpacing: "0.04em",
+            }}
+          >
+            Face recognition & intelligent organization
+          </p>
+          <div
+            style={{
+              width: "40px",
+              height: "1px",
+              background: "rgba(255,255,255,0.1)",
+            }}
+          />
+        </div>
       </div>
 
       {/* Error banner */}
