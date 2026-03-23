@@ -203,26 +203,49 @@ class RetrievalService:
     def _apply_filters(self, query, filters: Dict, session):
         """Apply structured filters to query"""
         
-        # Filter by people
+     #   Filter by people
+        # if 'people' in filters and filters['people']:
+        #     people_names = filters['people']
+        #     logger.info(f"Filtering by people: {people_names}")
+            
+        #     # Find cluster IDs for these names
+        #     clusters = session.query(Cluster).filter(
+        #         Cluster.name.in_(people_names)
+        #     ).all()
+            
+        #     if clusters:
+        #         cluster_ids = [c.cluster_id for c in clusters]
+                
+        #         # Filter photos that have these clusters
+        #         query = query.join(
+        #             PhotoCluster,
+        #             Photo.photo_id == PhotoCluster.photo_id
+        #         ).filter(
+        #             PhotoCluster.cluster_id.in_(cluster_ids)
+        #         )
+
+
+        # Filter by people — photo must contain ALL requested people
         if 'people' in filters and filters['people']:
             people_names = filters['people']
             logger.info(f"Filtering by people: {people_names}")
-            
-            # Find cluster IDs for these names
+
             clusters = session.query(Cluster).filter(
                 Cluster.name.in_(people_names)
             ).all()
-            
+
             if clusters:
                 cluster_ids = [c.cluster_id for c in clusters]
-                
-                # Filter photos that have these clusters
-                query = query.join(
-                    PhotoCluster,
-                    Photo.photo_id == PhotoCluster.photo_id
-                ).filter(
-                    PhotoCluster.cluster_id.in_(cluster_ids)
-                )
+
+                # Each cluster must be present in the photo (AND logic)
+                for cluster_id in cluster_ids:
+                    subq = session.query(PhotoCluster.photo_id).filter(
+                        PhotoCluster.cluster_id == cluster_id
+                    ).subquery()
+                    query = query.filter(Photo.photo_id.in_(subq))
+
+        
+        
         
         # Filter by emotions
         if 'emotions' in filters and filters['emotions']:
@@ -271,6 +294,9 @@ class RetrievalService:
             logger.info(f"Filtering by season: {season}")
             query = query.filter(Photo.season == season)
         
+        if 'weather' in filters and filters['weather']:
+            query = query.filter(Photo.weather == filters['weather'])
+
         # Filter by time of day
         if 'time_of_day' in filters and filters['time_of_day']:
             time_of_day = filters['time_of_day']
