@@ -54,6 +54,8 @@ class Photo(Base):
     location_type = Column(String(50))
     activity = Column(String(50))
 
+    weather = Column(String(50), nullable=True)   # 'rainy', 'sunny', 'snowy', 'cloudy'
+
     # Temporal Context
     season = Column(String(20))
     time_of_day = Column(String(20))
