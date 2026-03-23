@@ -77,13 +77,64 @@ class QueryParser:
         }
         
         # Common objects
+        # self.objects = [
+        #     'cake', 'pizza', 'food', 'wine', 'beer', 'coffee',
+        #     'car', 'bike', 'bicycle', 'motorcycle',
+        #     'laptop', 'phone', 'computer', 'camera',
+        #     'dog', 'cat', 'pet', 'animal',
+        #     'book', 'ball', 'umbrella', 'bag', 'backpack'
+        # ]
+        # Replace the self.objects list and add a synonym map in __init__
+
         self.objects = [
-            'cake', 'pizza', 'food', 'wine', 'beer', 'coffee',
-            'car', 'bike', 'bicycle', 'motorcycle',
-            'laptop', 'phone', 'computer', 'camera',
-            'dog', 'cat', 'pet', 'animal',
-            'book', 'ball', 'umbrella', 'bag', 'backpack'
+            # Food
+            'cake', 'pizza', 'burger', 'sandwich', 'food', 'wine', 'beer', 'coffee',
+            'sushi', 'ice cream', 'donut', 'hot dog', 'fries', 'fruit', 'salad',
+            # Animals
+            'dog', 'cat', 'cow', 'horse', 'bird', 'elephant', 'bear', 'zebra',
+            'giraffe', 'sheep', 'chicken', 'duck', 'rabbit', 'fish',
+            # Vehicles
+            'car', 'bike', 'bicycle', 'motorcycle', 'bus', 'truck', 'train',
+            'boat', 'plane', 'helicopter', 'scooter',
+            # Electronics
+            'laptop', 'phone', 'computer', 'camera', 'tv', 'keyboard',
+            # Nature / weather scene cues
+            'rain', 'snow', 'umbrella', 'beach', 'mountain', 'forest', 'sunset',
+            # Common items
+            'backpack', 'bag', 'suitcase', 'book', 'ball', 'bottle', 'cup',
+            'chair', 'table', 'couch', 'bed', 'flowers', 'tree',
         ]
+
+        self.weather_keywords = {
+            'rainy':  ['rainy', 'rain', 'raining', 'wet', 'drizzle'],
+            'snowy':  ['snowy', 'snow', 'snowing', 'winter storm', 'blizzard'],
+            'sunny':  ['sunny', 'sunshine', 'bright day', 'clear sky'],
+            'cloudy': ['cloudy', 'overcast', 'grey sky', 'gray sky'],
+        }
+
+        # Add this synonym map right after self.objects
+        self.object_synonyms = {
+            'burger':      'sandwich',
+            'hamburger':   'sandwich',
+            'motorbike':   'motorcycle',
+            'motorbicycle':'motorcycle',
+            'bike':        'bicycle',
+            'cellphone':   'cell phone',
+            'mobile':      'cell phone',
+            'couch':       'couch',
+            'sofa':        'couch',
+            'tv':          'tv',
+            'television':  'tv',
+            'aeroplane':   'airplane',
+            'plane':       'airplane',
+            'rainy':       'rain',
+            'snowy':       'snow',
+            'sunny':       'sun',
+            'canine':      'dog',
+            'puppy':       'dog',
+            'kitten':      'cat',
+            'feline':      'cat',
+        }
         
         # Time of day
         self.times_of_day = {
@@ -129,6 +180,7 @@ class QueryParser:
             'clothing': self._extract_clothing(query_lower),
             'scene_type': self._extract_scene_type(query_lower),
             'location': self._extract_location(query_lower),
+            'weather': self._extract_weather(query_lower),
             'time_of_day': self._extract_time_of_day(query_lower),
             'season': self._extract_season(query_lower),
             'date_range': self._extract_date_range(query_lower),
@@ -212,15 +264,34 @@ class QueryParser:
         
         return found_clothing if found_clothing else None
     
+    # def _extract_objects(self, query: str) -> Optional[List[str]]:
+    #     """Extract objects from query"""
+    #     found_objects = []
+        
+    #     for obj in self.objects:
+    #         if re.search(r'\b' + obj + r'\b', query):
+    #             found_objects.append(obj)
+        
+    #     return found_objects if found_objects else None
+
     def _extract_objects(self, query: str) -> Optional[List[str]]:
-        """Extract objects from query"""
         found_objects = []
-        
+
         for obj in self.objects:
-            if re.search(r'\b' + obj + r'\b', query):
-                found_objects.append(obj)
-        
+            if re.search(r'\b' + re.escape(obj) + r'\b', query):
+                # Map to canonical YOLO label if synonym exists
+                canonical = self.object_synonyms.get(obj, obj)
+                if canonical not in found_objects:
+                    found_objects.append(canonical)
+
+        # Also check synonym keys directly (e.g. user says "burger")
+        for user_word, yolo_label in self.object_synonyms.items():
+            if re.search(r'\b' + re.escape(user_word) + r'\b', query):
+                if yolo_label not in found_objects:
+                    found_objects.append(yolo_label)
+
         return found_objects if found_objects else None
+
     
     def _extract_scene_type(self, query: str) -> Optional[str]:
         """Extract indoor/outdoor from query"""
@@ -236,6 +307,14 @@ class QueryParser:
             for keyword in keywords:
                 if keyword in query:
                     return location
+        return None
+    
+    def _extract_weather(self, query: str) -> Optional[str]:
+        """Extract weather from query"""
+        for weather, keywords in self.weather_keywords.items():
+            for kw in keywords:
+                if kw in query:
+                    return weather
         return None
     
     def _extract_time_of_day(self, query: str) -> Optional[str]:
