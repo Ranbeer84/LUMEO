@@ -1,14 +1,7 @@
-"""
-SQLAlchemy Models for Lumeo - Phase 5 Enhanced
-Added conversation memory and summarization fields
-
-FIXES APPLIED:
-- Cluster.created_at and Cluster.updated_at restored as proper Column(DateTime) objects
-  (they were accidentally set as plain class attributes, so SQLAlchemy never mapped them)
-- Message column kept as 'meta_data' (avoids conflict with SQLAlchemy Base.metadata)
-"""
-
-from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, Text, ForeignKey, LargeBinary, Boolean
+from sqlalchemy import (
+    create_engine, Column, String, Integer, Float, DateTime, Text,
+    ForeignKey, LargeBinary, Boolean, UniqueConstraint
+)
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.dialects.postgresql import JSON
@@ -20,118 +13,97 @@ import uuid
 
 load_dotenv()
 
-# Database configuration
-DB_NAME = os.getenv('DB_NAME', 'lumeo_db')
-DB_USER = os.getenv('DB_USER', 'lumeo_user')
+DB_NAME     = os.getenv('DB_NAME',     'lumeo_db')
+DB_USER     = os.getenv('DB_USER',     'lumeo_user')
 DB_PASSWORD = os.getenv('DB_PASSWORD', 'lumeo_password')
-DB_HOST = os.getenv('DB_HOST', 'localhost')
-DB_PORT = os.getenv('DB_PORT', '5432')
+DB_HOST     = os.getenv('DB_HOST',     'localhost')
+DB_PORT     = os.getenv('DB_PORT',     '5432')
 
 DATABASE_URL = f'postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}'
 
-# Create engine and session
-engine = create_engine(DATABASE_URL, echo=False)
+engine  = create_engine(DATABASE_URL, echo=False)
 Session = sessionmaker(bind=engine)
-Base = declarative_base()
+Base    = declarative_base()
 
 
 # ============================================================================
-# PHASE 1-2: PHOTO & VISION MODELS
+# PHOTO & VISION MODELS
 # ============================================================================
 
 class Photo(Base):
-    """Photo model with enhanced metadata"""
     __tablename__ = 'photos'
 
-    photo_id = Column(String(255), primary_key=True)
-    filename = Column(String(255), nullable=False)
-    path = Column(String(500), nullable=False)
-    upload_date = Column(Float, nullable=False)
+    photo_id    = Column(String(255), primary_key=True)
+    filename    = Column(String(255), nullable=False)
+    path        = Column(String(500), nullable=False)
+    upload_date = Column(Float,       nullable=False)
 
-    # Vision Intelligence
     clip_embedding = Column(Vector(512))
-    scene_type = Column(String(20))
-    location_type = Column(String(50))
-    activity = Column(String(50))
+    scene_type     = Column(String(100), nullable=True)
+    location_type  = Column(String(50))
+    activity       = Column(String(50))
+    weather        = Column(String(50), nullable=True)
 
-    weather = Column(String(50), nullable=True)   # 'rainy', 'sunny', 'snowy', 'cloudy'
-
-    # Temporal Context
-    season = Column(String(20))
+    season      = Column(String(20))
     time_of_day = Column(String(20))
-    date_taken = Column(DateTime)
+    date_taken  = Column(DateTime)
 
-    # Camera Metadata
-    camera_make = Column(String(100))
+    camera_make  = Column(String(100))
     camera_model = Column(String(100))
 
-    # GPS
-    gps_latitude = Column(Float)
+    gps_latitude  = Column(Float)
     gps_longitude = Column(Float)
 
-    # Image Quality
     image_quality = Column(Float)
+    caption       = Column(Text)
 
-    # AI-Generated Content
-    caption = Column(Text)
-
-    # Emotion Analysis
     dominant_emotion = Column(String(20))
-    mood_score = Column(Float)
+    mood_score       = Column(Float)
+    face_count       = Column(Integer, default=0)
 
-    # Relationships
-    face_embeddings = relationship('FaceEmbedding', back_populates='photo', cascade='all, delete-orphan')
-    photo_clusters = relationship('PhotoCluster', back_populates='photo', cascade='all, delete-orphan')
-    detected_objects = relationship('DetectedObject', back_populates='photo', cascade='all, delete-orphan')
+    face_embeddings      = relationship('FaceEmbedding',      back_populates='photo', cascade='all, delete-orphan')
+    photo_clusters       = relationship('PhotoCluster',        back_populates='photo', cascade='all, delete-orphan')
+    detected_objects     = relationship('DetectedObject',      back_populates='photo', cascade='all, delete-orphan')
+    object_cluster_links = relationship('PhotoObjectCluster',  back_populates='photo', cascade='all, delete-orphan')
 
     def __repr__(self):
         return f"<Photo(id={self.photo_id}, filename={self.filename})>"
 
 
 class Cluster(Base):
-    """Cluster/Person model"""
     __tablename__ = 'clusters'
 
-    cluster_id = Column(String(255), primary_key=True)
-    name = Column(String(255), nullable=False)
-    face_count = Column(Integer, default=0)
+    cluster_id  = Column(String(255), primary_key=True)
+    name        = Column(String(255), nullable=False)
+    face_count  = Column(Integer, default=0)
     photo_count = Column(Integer, default=0)
-    thumbnail = Column(String(255))
+    thumbnail   = Column(String(255))
 
-    # FIX: These were plain class attributes before (not SQLAlchemy Columns).
-    # SQLAlchemy never persisted them to the DB, and setting them on instances
-    # had no effect. Restored as proper Column definitions.
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    # Relationships
     face_embeddings = relationship('FaceEmbedding', back_populates='cluster', cascade='all, delete-orphan')
-    photo_clusters = relationship('PhotoCluster', back_populates='cluster', cascade='all, delete-orphan')
+    photo_clusters  = relationship('PhotoCluster',  back_populates='cluster', cascade='all, delete-orphan')
 
     def __repr__(self):
         return f"<Cluster(id={self.cluster_id}, name={self.name})>"
 
 
 class FaceEmbedding(Base):
-    """Face embedding with emotion and quality"""
     __tablename__ = 'face_embeddings'
 
-    embedding_id = Column(Integer, primary_key=True, autoincrement=True)
-    photo_id = Column(String(255), ForeignKey('photos.photo_id', ondelete='CASCADE'))
-    cluster_id = Column(String(255), ForeignKey('clusters.cluster_id', ondelete='CASCADE'))
-    embedding = Column(LargeBinary, nullable=False)
+    embedding_id  = Column(Integer, primary_key=True, autoincrement=True)
+    photo_id      = Column(String(255), ForeignKey('photos.photo_id',     ondelete='CASCADE'))
+    cluster_id    = Column(String(255), ForeignKey('clusters.cluster_id', ondelete='CASCADE'))
+    embedding     = Column(LargeBinary, nullable=False)
     face_location = Column(Text)
 
-    # Emotion Analysis
-    emotion = Column(String(20))
+    emotion            = Column(String(20))
     emotion_confidence = Column(Float)
-    emotion_valence = Column(Float)
+    emotion_valence    = Column(Float)
+    quality_score      = Column(Float)
 
-    # Quality Assessment
-    quality_score = Column(Float)
-
-    # Relationships
-    photo = relationship('Photo', back_populates='face_embeddings')
+    photo   = relationship('Photo',   back_populates='face_embeddings')
     cluster = relationship('Cluster', back_populates='face_embeddings')
 
     def __repr__(self):
@@ -139,14 +111,12 @@ class FaceEmbedding(Base):
 
 
 class PhotoCluster(Base):
-    """Junction table for photo-cluster relationship"""
     __tablename__ = 'photo_clusters'
 
-    photo_id = Column(String(255), ForeignKey('photos.photo_id', ondelete='CASCADE'), primary_key=True)
+    photo_id   = Column(String(255), ForeignKey('photos.photo_id',    ondelete='CASCADE'), primary_key=True)
     cluster_id = Column(String(255), ForeignKey('clusters.cluster_id', ondelete='CASCADE'), primary_key=True)
 
-    # Relationships
-    photo = relationship('Photo', back_populates='photo_clusters')
+    photo   = relationship('Photo',   back_populates='photo_clusters')
     cluster = relationship('Cluster', back_populates='photo_clusters')
 
     def __repr__(self):
@@ -154,28 +124,22 @@ class PhotoCluster(Base):
 
 
 class DetectedObject(Base):
-    """Detected objects from YOLO"""
     __tablename__ = 'detected_objects'
 
-    object_id = Column(Integer, primary_key=True, autoincrement=True)
-    photo_id = Column(String(255), ForeignKey('photos.photo_id', ondelete='CASCADE'), nullable=False)
+    object_id  = Column(Integer, primary_key=True, autoincrement=True)
+    photo_id   = Column(String(255), ForeignKey('photos.photo_id', ondelete='CASCADE'), nullable=False)
+    label      = Column(String(100), nullable=False)
+    confidence = Column(Float,       nullable=False)
 
-    label = Column(String(100), nullable=False)
-    confidence = Column(Float, nullable=False)
-
-    # Bounding Box
     bbox_x1 = Column(Integer)
     bbox_y1 = Column(Integer)
     bbox_x2 = Column(Integer)
     bbox_y2 = Column(Integer)
 
-    # Color Information
     dominant_color_rgb = Column(String(50))
-    color_name = Column(String(50))
+    color_name         = Column(String(50))
+    created_at         = Column(DateTime, default=datetime.utcnow)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    # Relationship
     photo = relationship('Photo', back_populates='detected_objects')
 
     def __repr__(self):
@@ -183,38 +147,62 @@ class DetectedObject(Base):
 
 
 # ============================================================================
+# OBJECT CLUSTER MODELS 
+# ============================================================================
+
+class ObjectCluster(Base):
+    __tablename__ = 'object_clusters'
+
+    cluster_id = Column(String(255), primary_key=True, default=lambda: str(uuid.uuid4()))
+    category   = Column(String(100), unique=True, nullable=False)
+    label      = Column(String(100), nullable=False)
+    icon       = Column(String(10),  nullable=True)
+    photo_count = Column(Integer, default=0)
+
+    thumbnail_photo_id = Column(String(255), ForeignKey('photos.photo_id'), nullable=True)
+
+    thumbnail_photo = relationship('Photo', foreign_keys=[thumbnail_photo_id])
+    photo_links     = relationship('PhotoObjectCluster', back_populates='cluster', cascade='all, delete-orphan')
+
+    def __repr__(self):
+        return f"<ObjectCluster(category={self.category}, photos={self.photo_count})>"
+
+
+class PhotoObjectCluster(Base):
+    __tablename__ = 'photo_object_clusters'
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    photo_id   = Column(String(255), ForeignKey('photos.photo_id'),            nullable=False)
+    cluster_id = Column(String(255), ForeignKey('object_clusters.cluster_id'), nullable=False)
+
+    photo   = relationship('Photo',         back_populates='object_cluster_links')
+    cluster = relationship('ObjectCluster', back_populates='photo_links')
+
+    __table_args__ = (
+        UniqueConstraint('photo_id', 'cluster_id', name='uq_photo_object_cluster'),
+    )
+
+    def __repr__(self):
+        return f"<PhotoObjectCluster(photo={self.photo_id}, cluster={self.cluster_id})>"
+
+
+# ============================================================================
 # CONVERSATION & MEMORY MODELS
 # ============================================================================
 
 class Conversation(Base):
-    """
-    Conversation/chat session with memory features.
-
-    Phase 5 Enhancements:
-    - needs_summary: Flag for auto-summarization
-    - last_summarized_at: Timestamp of last summary
-    """
     __tablename__ = 'conversations'
 
-    conversation_id = Column(
-        String(255),
-        primary_key=True,
-        default=lambda: f"conv_{uuid.uuid4().hex[:12]}"
-    )
-    user_id = Column(String(255), default="default_user")
+    conversation_id = Column(String(255), primary_key=True, default=lambda: f"conv_{uuid.uuid4().hex[:12]}")
+    user_id         = Column(String(255), default="default_user")
+    created_at      = Column(Float, nullable=False)
+    updated_at      = Column(Float, nullable=False)
+    message_count   = Column(Integer, default=0)
+    summary         = Column(Text)
 
-    created_at = Column(Float, nullable=False)
-    updated_at = Column(Float, nullable=False)
-
-    # Conversation metadata
-    message_count = Column(Integer, default=0)
-    summary = Column(Text)  # Auto-generated summary
-
-    # Phase 5: Memory Management
-    needs_summary = Column(Boolean, default=False)
+    needs_summary      = Column(Boolean, default=False)
     last_summarized_at = Column(Float)
 
-    # Relationships
     messages = relationship('Message', back_populates='conversation', cascade='all, delete-orphan')
 
     def __repr__(self):
@@ -222,30 +210,16 @@ class Conversation(Base):
 
 
 class Message(Base):
-    """Individual message in a conversation"""
     __tablename__ = 'messages'
 
-    message_id = Column(Integer, primary_key=True, autoincrement=True)
-    conversation_id = Column(
-        String(255),
-        ForeignKey('conversations.conversation_id', ondelete='CASCADE'),
-        nullable=False
-    )
+    message_id      = Column(Integer, primary_key=True, autoincrement=True)
+    conversation_id = Column(String(255), ForeignKey('conversations.conversation_id', ondelete='CASCADE'), nullable=False)
+    role            = Column(String(20), nullable=False)
+    content         = Column(Text,       nullable=False)
+    retrieved_photo_ids = Column(Text)
+    meta_data       = Column(JSON)
+    created_at      = Column(Float, nullable=False)
 
-    role = Column(String(20), nullable=False)   # 'user' or 'assistant'
-    content = Column(Text, nullable=False)
-
-    # Retrieved context for this message
-    retrieved_photo_ids = Column(Text)  # JSON list of photo IDs
-
-    # NOTE: Named 'meta_data' (not 'metadata') to avoid collision with
-    # SQLAlchemy's own Base.metadata class attribute.
-    # All code that reads/writes this must use 'meta_data'.
-    meta_data = Column(JSON)
-
-    created_at = Column(Float, nullable=False)
-
-    # Relationship
     conversation = relationship('Conversation', back_populates='messages')
 
     def __repr__(self):
@@ -253,57 +227,88 @@ class Message(Base):
 
 
 # ============================================================================
-# DATABASE INIT & MIGRATION
+# DATABASE INIT 
 # ============================================================================
 
-def init_db():
-    """Initialize database tables"""
-    Base.metadata.create_all(engine)
-    print("✓ Database tables initialized (Phase 5)")
-
-
 def migrate_to_phase5():
-    """
-    Add Phase 5 columns to existing Conversation table.
-    Safe to run multiple times (uses IF NOT EXISTS equivalent via try/except).
-    """
+    """Add Phase 5 columns to conversations table (safe to run multiple times)."""
     from sqlalchemy import text
-
     with engine.connect() as conn:
         for col_sql, col_name in [
             ("ALTER TABLE conversations ADD COLUMN needs_summary BOOLEAN DEFAULT FALSE", "needs_summary"),
-            ("ALTER TABLE conversations ADD COLUMN last_summarized_at FLOAT", "last_summarized_at"),
+            ("ALTER TABLE conversations ADD COLUMN last_summarized_at FLOAT",            "last_summarized_at"),
         ]:
             try:
                 conn.execute(text(col_sql))
-                print(f"✓ Added {col_name} column")
+                print(f"✓ Added {col_name}")
             except Exception:
-                print(f"  {col_name} column already exists (skipping)")
+                print(f"  {col_name} already exists (skipping)")
         conn.commit()
 
-    print("✓ Phase 5 migration complete")
+
+def migrate_to_phase5_plus():
+    """
+    Create Phase 5+ tables and columns if they do not yet exist.
+    Safe to call on every startup.
+    """
+    from sqlalchemy import text, inspect as sa_inspect
+
+    # New optional columns on photos
+    photo_migrations = [
+        ("ALTER TABLE photos ADD COLUMN face_count INTEGER DEFAULT 0", "photos.face_count"),
+        ("ALTER TABLE photos ADD COLUMN weather VARCHAR(50)",          "photos.weather"),
+    ]
+    with engine.connect() as conn:
+        for col_sql, col_name in photo_migrations:
+            try:
+                conn.execute(text(col_sql))
+                print(f"✓ Added column {col_name}")
+            except Exception:
+                print(f"  Column {col_name} already exists (skipping)")
+        conn.commit()
+
+    # Create new tables (idempotent)
+    inspector = sa_inspect(engine)
+    existing  = inspector.get_table_names()
+    for table in [ObjectCluster.__table__, PhotoObjectCluster.__table__]:
+        if table.name not in existing:
+            table.create(engine)
+            print(f"✓ Created table '{table.name}'")
+        else:
+            print(f"  Table '{table.name}' already exists (skipping)")
+
+
+def init_db():
+    
+    # create_all is a no-op for tables that already exist
+    Base.metadata.create_all(engine)
+
+    # Apply incremental migrations for tables/columns added after initial deploy
+    try:
+        migrate_to_phase5()
+    except Exception as e:
+        print(f"Phase 5 migration note: {e}")
+
+    try:
+        migrate_to_phase5_plus()
+    except Exception as e:
+        print(f"Phase 5+ migration note: {e}")
+
+    print("✓ Database tables initialized/verified (Phase 5+)")
 
 
 if __name__ == '__main__':
     try:
         print(f"Connecting to: {DATABASE_URL.replace(DB_PASSWORD, '***')}")
-
         init_db()
-        migrate_to_phase5()
 
         session = Session()
-        photo_count       = session.query(Photo).count()
-        cluster_count     = session.query(Cluster).count()
-        conversation_count = session.query(Conversation).count()
-        message_count     = session.query(Message).count()
-
         print(f"\n✓ Database connected successfully")
-        print(f"  - Photos:        {photo_count}")
-        print(f"  - Clusters:      {cluster_count}")
-        print(f"  - Conversations: {conversation_count}")
-        print(f"  - Messages:      {message_count}")
-
+        print(f"  - Photos          : {session.query(Photo).count()}")
+        print(f"  - People clusters : {session.query(Cluster).count()}")
+        print(f"  - Object clusters : {session.query(ObjectCluster).count()}")
+        print(f"  - Conversations   : {session.query(Conversation).count()}")
+        print(f"  - Messages        : {session.query(Message).count()}")
         session.close()
-
     except Exception as e:
         print(f"✗ Database connection failed: {e}")
