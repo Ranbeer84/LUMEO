@@ -10,15 +10,12 @@ import PhotoCanvas from "./components/PhotoCanvas";
 import ClusterModal from "./components/modals/ClusterModal";
 import PhotoModal from "./components/modals/PhotoModal";
 import ClusterManager from "./components/ClusterManager";
-
-// ─── App ──────────────────────────────────────────────────────────────────────
+import ObjectClusters from "./components/ObjectClusters";
+import { SmokeBackground } from "./components/ui/SmokeBackground";
 
 function App() {
-  // ── App routing ────────────────────────────────────────────────────────────
-  const [appMode, setAppMode] = useState("home"); // 'home' | 'organize' | 'chat' | 'clusters'
+  const [appMode, setAppMode] = useState("home");
   const [hasPhotos, setHasPhotos] = useState(false);
-
-  // ── Organize flow ──────────────────────────────────────────────────────────
   const [photos, setPhotos] = useState([]);
   const [clusters, setClusters] = useState([]);
   const [stats, setStats] = useState({ total_faces: 0 });
@@ -26,13 +23,9 @@ function App() {
   const [currentStep, setCurrentStep] = useState("upload");
   const [error, setError] = useState("");
   const [hoveredCluster, setHoveredCluster] = useState(null);
-
-  // ── Modals ─────────────────────────────────────────────────────────────────
   const [viewingCluster, setViewingCluster] = useState(null);
   const [clusterPhotos, setClusterPhotos] = useState([]);
   const [selectedPhoto, setSelectedPhoto] = useState(null);
-
-  // ── Chat ───────────────────────────────────────────────────────────────────
   const [messages, setMessages] = useState([
     {
       id: 1,
@@ -46,8 +39,7 @@ function App() {
   const [isTyping, setIsTyping] = useState(false);
   const [retrievedPhotos, setRetrievedPhotos] = useState([]);
   const [viewMode, setViewMode] = useState("grid");
-
-  // ── Organize handlers ──────────────────────────────────────────────────────
+  const [objectsOnly, setObjectsOnly] = useState(false);
 
   const handleFileUpload = async (e) => {
     const files = Array.from(e.target.files);
@@ -180,12 +172,9 @@ function App() {
     }
   };
 
-  // ── Chat handler ───────────────────────────────────────────────────────────
-
   const handleSendMessage = async (e) => {
     e.preventDefault();
     if (!inputMessage.trim() || isTyping) return;
-
     const userMsg = {
       id: Date.now(),
       role: "user",
@@ -196,7 +185,6 @@ function App() {
     setInputMessage("");
     setIsTyping(true);
     setRetrievedPhotos([]);
-
     try {
       const res = await fetch(`${API_URL}/chat/stream`, {
         method: "POST",
@@ -208,9 +196,7 @@ function App() {
           stream: true,
         }),
       });
-
       const contentType = res.headers.get("content-type");
-
       if (contentType?.includes("application/json")) {
         const data = await res.json();
         if (data.error) throw new Error(data.error);
@@ -234,7 +220,6 @@ function App() {
           timestamp: Date.now(),
         };
         setMessages((prev) => [...prev, assistantMsg]);
-
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -279,8 +264,6 @@ function App() {
     }
   };
 
-  // ── Effects ────────────────────────────────────────────────────────────────
-
   useEffect(() => {
     if (currentStep === "label") loadClusters();
   }, [currentStep]);
@@ -304,89 +287,130 @@ function App() {
     <div
       style={{
         minHeight: "100vh",
-        background:
-          "linear-gradient(180deg, #000000 0%, #1a1a2e 50%, #16213e 100%)",
-        padding: "20px",
+        position: "relative",
+        color: "#ffffff",
         fontFamily:
           '-apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif',
-        color: "#ffffff",
-        boxSizing: "border-box",
       }}
     >
-      {/* ── Home ─────────────────────────────────────────────────────────── */}
-      {appMode === "home" && (
-        <HomeMode
-          hasPhotos={hasPhotos}
-          setAppMode={setAppMode}
-          resetApp={resetApp}
-        />
-      )}
+      {/* ── Smoke Background (fixed, behind everything) ───────────────────── */}
+      <div
+        style={{
+          position: "fixed",
+          inset: 0,
+          zIndex: 0,
+          background: "linear-gradient(180deg, #000000 0%, #0d0d1a 100%)",
+        }}
+      >
+        <SmokeBackground smokeColor="#3b1f6e" />
+      </div>
 
-      {/* ── Organize ─────────────────────────────────────────────────────── */}
-      {appMode === "organize" && (
-        <OrganizeMode
-          currentStep={currentStep}
-          photos={photos}
-          clusters={clusters}
-          stats={stats}
-          processing={processing}
-          error={error}
-          hoveredCluster={hoveredCluster}
-          setHoveredCluster={setHoveredCluster}
-          handleFileUpload={handleFileUpload}
-          processPhotos={processPhotos}
-          organizePhotos={organizePhotos}
+      {/* ── All content (sits above the canvas) ──────────────────────────── */}
+      <div
+        style={{
+          position: "relative",
+          zIndex: 1,
+          padding: "20px",
+          boxSizing: "border-box",
+        }}
+      >
+        {appMode === "home" && (
+          <HomeMode
+            hasPhotos={hasPhotos}
+            setAppMode={setAppMode}
+            resetApp={resetApp}
+          />
+        )}
+
+        {appMode === "organize" && (
+          <OrganizeMode
+            currentStep={currentStep}
+            photos={photos}
+            clusters={clusters}
+            stats={stats}
+            processing={processing}
+            error={error}
+            hoveredCluster={hoveredCluster}
+            setHoveredCluster={setHoveredCluster}
+            handleFileUpload={handleFileUpload}
+            processPhotos={processPhotos}
+            organizePhotos={organizePhotos}
+            updateClusterName={updateClusterName}
+            viewClusterPhotos={viewClusterPhotos}
+            setAppMode={setAppMode}
+          />
+        )}
+
+        {appMode === "clusters" && <ClusterManager setAppMode={setAppMode} />}
+
+        {/* ── Objects mode ─────────────────────────────────────────────── */}
+        {appMode === "objects" && (
+          <div style={{ maxWidth: "1400px", margin: "0 auto" }}>
+            {/* Back button */}
+            <button
+              onClick={() => setAppMode("home")}
+              style={{
+                background: "rgba(255,255,255,0.08)",
+                border: "1px solid rgba(255,255,255,0.15)",
+                color: "#ffffff",
+                padding: "8px 18px",
+                borderRadius: "10px",
+                cursor: "pointer",
+                fontSize: "14px",
+                marginBottom: "20px",
+                backdropFilter: "blur(8px)",
+              }}
+            >
+              ← Back
+            </button>
+
+            {/* The actual grid — ObjectClusters fetches its own data */}
+            <ObjectClusters objectsOnly={objectsOnly} />
+          </div>
+        )}
+        {/* ─────────────────────────────────────────────────────────────── */}
+
+        {appMode === "chat" && (
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "400px 1fr",
+              gap: "20px",
+              height: "calc(100vh - 40px)",
+              maxWidth: "1800px",
+              margin: "0 auto",
+            }}
+          >
+            <ChatPanel
+              messages={messages}
+              isTyping={isTyping}
+              inputMessage={inputMessage}
+              setInputMessage={setInputMessage}
+              retrievedCount={retrievedPhotos.length}
+              onSend={handleSendMessage}
+              onBack={() => setAppMode("home")}
+            />
+            <PhotoCanvas
+              retrievedPhotos={retrievedPhotos}
+              viewMode={viewMode}
+              setViewMode={setViewMode}
+              onPhotoClick={setSelectedPhoto}
+            />
+          </div>
+        )}
+
+        <ClusterModal
+          viewingCluster={viewingCluster}
+          clusterPhotos={clusterPhotos}
+          onClose={() => setViewingCluster(null)}
+          onPhotoClick={setSelectedPhoto}
           updateClusterName={updateClusterName}
-          viewClusterPhotos={viewClusterPhotos}
-          setAppMode={setAppMode}
         />
-      )}
-      
-      {/* ── Clusters ─────────────────────────────────────────────────────── */}
-      {appMode === "clusters" && <ClusterManager setAppMode={setAppMode} />}
-
-      {/* ── Chat ─────────────────────────────────────────────────────────── */}
-      {appMode === "chat" && (
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "400px 1fr",
-            gap: "20px",
-            height: "calc(100vh - 40px)",
-            maxWidth: "1800px",
-            margin: "0 auto",
-          }}
-        >
-          <ChatPanel
-            messages={messages}
-            isTyping={isTyping}
-            inputMessage={inputMessage}
-            setInputMessage={setInputMessage}
-            retrievedCount={retrievedPhotos.length}
-            onSend={handleSendMessage}
-            onBack={() => setAppMode("home")}
-          />
-          <PhotoCanvas
-            retrievedPhotos={retrievedPhotos}
-            viewMode={viewMode}
-            setViewMode={setViewMode}
-            onPhotoClick={setSelectedPhoto}
-          />
-        </div>
-      )}
-
-      {/* ── Modals ───────────────────────────────────────────────────────── */}
-      <ClusterModal
-        viewingCluster={viewingCluster}
-        clusterPhotos={clusterPhotos}
-        onClose={() => setViewingCluster(null)}
-        onPhotoClick={setSelectedPhoto}
-        updateClusterName={updateClusterName}
-      />
-      <PhotoModal
-        selectedPhoto={selectedPhoto}
-        onClose={() => setSelectedPhoto(null)}
-      />
+        <PhotoModal
+          selectedPhoto={selectedPhoto}
+          onClose={() => setSelectedPhoto(null)}
+        />
+      </div>
     </div>
   );
 }
