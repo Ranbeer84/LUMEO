@@ -4,6 +4,7 @@ import os
 import shutil
 import json
 import time
+import uuid
 import numpy as np
 from datetime import datetime
 import logging
@@ -11,24 +12,23 @@ import logging
 # Import SQLAlchemy models 
 from models import (
     Session, Photo, Cluster, FaceEmbedding, 
-    DetectedObject, PhotoCluster, Conversation, Message
+    DetectedObject, PhotoCluster, Conversation, Message,
+    init_db  
 )
 
-# Import vision services 
 try:
     from services.pipeline_service import get_pipeline
     from services.face_service import get_face_service
     from services.clip_service import get_clip_service
-
     from services.query_service import get_query_service
     from services.retrieval_service import get_retrieval_service
     from services.context_service import get_context_service
     from services.query_parser import get_query_parser
-
     from services.llm_service import get_llm_service
     from services.conversation_service import get_conversation_service
     from services.memory_service import get_memory_service
-    
+    from services.object_cluster_service import get_object_cluster_service
+
     SERVICES_AVAILABLE = True
 except ImportError as e:
     print(f"⚠️  WARNING: Services not available: {e}")
@@ -42,7 +42,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize Flask app
 app = Flask(__name__)
 CORS(app)
 
@@ -55,6 +54,13 @@ THUMBNAILS_FOLDER = 'thumbnails'
 for folder in [UPLOAD_FOLDER, ORGANIZED_FOLDER, THUMBNAILS_FOLDER]:
     os.makedirs(folder, exist_ok=True)
 
+
+try:
+    init_db()
+    logger.info("✓ Database tables verified/created")
+except Exception as _db_init_err:
+    logger.warning(f"DB init warning: {_db_init_err}")
+
 logger.info("✓ Lumeo backend initialized")
 logger.info(f"✓ Services available: {SERVICES_AVAILABLE}")
 
@@ -64,12 +70,10 @@ logger.info(f"✓ Services available: {SERVICES_AVAILABLE}")
 
 @app.route('/uploads/<path:filename>')
 def serve_upload(filename):
-    """Serve uploaded photos"""
     return send_from_directory(UPLOAD_FOLDER, filename)
 
 @app.route('/thumbnails/<path:filename>')
 def serve_thumbnail(filename):
-    """Serve face thumbnails"""
     return send_from_directory(THUMBNAILS_FOLDER, filename)
 
 # ============================================================================
@@ -78,12 +82,10 @@ def serve_thumbnail(filename):
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
     session = Session()
     try:
         photo_count = session.query(Photo).count()
         session.close()
-        
         return jsonify({
             'status': 'healthy',
             'database': 'connected',
@@ -92,64 +94,36 @@ def health_check():
         })
     except Exception as e:
         session.close()
-        return jsonify({
-            'status': 'unhealthy',
-            'error': str(e)
-        }), 500
+        return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
 
 @app.route('/api/pipeline-status', methods=['GET'])
 def pipeline_status():
-    """Check if AI services are ready"""
     if not SERVICES_AVAILABLE:
-        return jsonify({
-            'ready': False,
-            'error': 'Services not imported'
-        }), 500
-    
+        return jsonify({'ready': False, 'error': 'Services not imported'}), 500
     try:
         pipeline = get_pipeline()
         stats = pipeline.get_processing_stats()
-        
-        return jsonify({
-            'ready': all(stats.values()),
-            'services': stats
-        })
+        return jsonify({'ready': all(stats.values()), 'services': stats})
     except Exception as e:
-        return jsonify({
-            'ready': False,
-            'error': str(e)
-        }), 500
+        return jsonify({'ready': False, 'error': str(e)}), 500
 
 @app.route('/api/upload', methods=['POST'])
 def upload_photos():
-    """
-    Upload photos to the system
-    
-    Request: multipart/form-data with 'photos' field
-    Response: List of uploaded photo info
-    """
     if 'photos' not in request.files:
         return jsonify({'error': 'No photos uploaded'}), 400
-    
     files = request.files.getlist('photos')
     if not files:
         return jsonify({'error': 'No photos selected'}), 400
-    
+
     uploaded_photos = []
     session = Session()
-    
     try:
         for file in files:
             if file.filename:
-                # Generate unique filename
                 timestamp = datetime.now().timestamp()
                 filename = f"{timestamp}_{file.filename}"
                 filepath = os.path.join(UPLOAD_FOLDER, filename)
-                
-                # Save file
                 file.save(filepath)
-                
-                # Create database record
                 photo_id = f"photo_{timestamp}_{len(uploaded_photos)}"
                 photo = Photo(
                     photo_id=photo_id,
@@ -158,24 +132,11 @@ def upload_photos():
                     upload_date=time.time()
                 )
                 session.add(photo)
-                
-                uploaded_photos.append({
-                    'photo_id': photo_id,
-                    'filename': filename,
-                    'path': filepath
-                })
-                
+                uploaded_photos.append({'photo_id': photo_id, 'filename': filename, 'path': filepath})
                 logger.info(f"✓ Uploaded: {filename}")
-        
         session.commit()
         logger.info(f"✓ Uploaded {len(uploaded_photos)} photos")
-        
-        return jsonify({
-            'success': True,
-            'photos_count': len(uploaded_photos),
-            'photos': uploaded_photos
-        })
-        
+        return jsonify({'success': True, 'photos_count': len(uploaded_photos), 'photos': uploaded_photos})
     except Exception as e:
         session.rollback()
         logger.error(f"Upload error: {str(e)}")
@@ -183,105 +144,153 @@ def upload_photos():
     finally:
         session.close()
 
+
+# ── load centroid for every existing cluster from stored face bytes ──
+def _load_existing_cluster_centroids(session):
+    """
+    Returns {cluster_id: mean_encoding (np.ndarray)} for all clusters
+    that have at least one stored FaceEmbedding.
+    """
+    centroids = {}
+    clusters = session.query(Cluster).all()
+    for cl in clusters:
+        embs = session.query(FaceEmbedding).filter_by(cluster_id=cl.cluster_id).all()
+        if not embs:
+            continue
+        vecs = []
+        for fe in embs:
+            try:
+                # Embeddings are stored as raw bytes (float64)
+                v = np.frombuffer(fe.embedding, dtype=np.float64)
+                if v.shape[0] == 128:          # face_recognition uses 128-d
+                    vecs.append(v)
+            except Exception:
+                pass
+        if vecs:
+            centroids[cl.cluster_id] = np.mean(vecs, axis=0)
+    return centroids
+
+
+# ── find closest existing cluster for a new centroid ──
+def _match_to_existing_cluster(new_centroid, existing_centroids, threshold=0.55):
+    """
+    Returns the cluster_id of the closest existing cluster if its distance
+    is below *threshold*, otherwise returns None.
+
+    threshold 0.55 is slightly tighter than the DBSCAN eps=0.6 so we only
+    merge when we are reasonably confident.
+    """
+    best_id = None
+    best_dist = float('inf')
+    for cid, centroid in existing_centroids.items():
+        dist = float(np.linalg.norm(new_centroid - centroid))
+        if dist < threshold and dist < best_dist:
+            best_dist = dist
+            best_id = cid
+    return best_id
+
+
 @app.route('/api/process', methods=['POST'])
 def process_photos():
     """
-    Process photos through vision pipeline and face clustering
-    
-    FIXED: Prevents duplicate photo_cluster entries
+    Process photos through vision pipeline and face clustering.
+
+    KEY FIX (face clustering):
+    Previously, DBSCAN label indices (0, 1, 2 …) were used directly as
+    cluster IDs ("cluster_0", "cluster_1" …).  These indices are positional
+    and change on every run, so the same person ends up with a different ID
+    each time, breaking any name you assigned and mixing people across runs.
+
+    The fix:
+    1. Load the centroid (mean encoding) of every EXISTING cluster from the DB.
+    2. After DBSCAN assigns new faces to temporary labels, compute each label's
+       centroid and compare it against existing centroids.
+    3. If the distance is small enough (< 0.55) → reuse the existing cluster ID
+       (and therefore keep its name).
+    4. If no existing cluster matches → create a brand-new cluster with a random
+       UUID-based ID that is stable across runs.
     """
     if not SERVICES_AVAILABLE:
         return jsonify({
             'error': 'Vision services not available',
             'message': 'Ensure services/ directory exists with all modules'
         }), 500
-    
+
     try:
         pipeline = get_pipeline()
         face_service = get_face_service()
         session = Session()
-        
-        # Check if services are ready
+
         stats = pipeline.get_processing_stats()
         if not all(stats.values()):
-            return jsonify({
-                'error': 'Some services not ready',
-                'service_status': stats
-            }), 500
-        
-        # Get unprocessed photos (those without CLIP embeddings)
+            return jsonify({'error': 'Some services not ready', 'service_status': stats}), 500
+
         photos = session.query(Photo).filter(Photo.clip_embedding == None).all()
-        
+
         if not photos:
             session.close()
-            return jsonify({
-                'message': 'No unprocessed photos found',
-                'clusters': []
-            }), 200
-        
-        logger.info(f"========================================")
+            return jsonify({'message': 'No unprocessed photos found', 'clusters': []}), 200
+
+        logger.info(f"{'='*40}")
         logger.info(f"Processing {len(photos)} photos with vision pipeline")
-        logger.info(f"========================================")
-        
-        all_faces_data = []  # For clustering
+        logger.info(f"{'='*40}")
+
+        all_faces_data = []
         processed_count = 0
-        
-        # =====================================================================
-        # STEP 1: VISION PIPELINE - Analyze each photo
-        # =====================================================================
-        
+
+        # =================================================================
+        # STEP 1: VISION PIPELINE
+        # =================================================================
         for idx, photo in enumerate(photos):
             logger.info(f"\n--- Photo {idx + 1}/{len(photos)}: {photo.filename} ---")
-            
+
             if not os.path.exists(photo.path):
                 logger.warning(f"File not found: {photo.path}")
                 continue
-            
-            # Run full vision pipeline
+
             result = pipeline.process_photo(photo.path, photo.photo_id)
-            
+
             if not result.get('analysis_complete'):
                 logger.error(f"Pipeline failed: {result.get('error')}")
                 continue
-            
+
             try:
-                # Update photo with vision analysis results
-                
-                # CLIP embedding (for semantic search in Phase 3)
                 if result.get('clip_embedding'):
                     photo.clip_embedding = result['clip_embedding']
-                
-                # Scene classification
+
                 scene = result.get('scene', {})
-                photo.scene_type = scene.get('scene_type')
-                photo.location_type = scene.get('location')
-                photo.activity = scene.get('activity')
-                
-                # Caption
-                photo.caption = result.get('caption')
-                
-                # Emotion aggregation
+                photo.scene_type    = scene.get('scene_type', 'general')
+                photo.activity      = scene.get('activity')
+                photo.face_count    = result.get('face_count', 0)
+                photo.weather       = result.get('weather', 'unknown')
+ 
+                # Prefer the specific scene_label from detect_scene_and_weather
+                # (e.g. "beach", "kitchen", "road/street") over the generic classify_scene
+                # location (e.g. "beach", "dining") because SCENE_TO_CATEGORY uses the
+                # detect_scene_and_weather labels. Fall back to classify_scene location.
+                specific_scene = result.get('scene_label')  # from detect_scene_and_weather
+                generic_location = scene.get('location')    # from classify_scene
+                photo.location_type = specific_scene or generic_location
+                photo.caption     = result.get('caption')
+
                 photo_emotion = result.get('photo_emotion', {})
                 photo.dominant_emotion = photo_emotion.get('dominant_emotion')
-                photo.mood_score = photo_emotion.get('mood_score')
-                
-                # Metadata from EXIF
+                photo.mood_score       = photo_emotion.get('mood_score')
+
                 metadata = result.get('metadata', {})
                 if metadata.get('date_taken'):
                     photo.date_taken = metadata['date_taken']
-                photo.season = metadata.get('season')
+                photo.season      = metadata.get('season')
                 photo.time_of_day = metadata.get('time_of_day')
-                photo.camera_make = metadata.get('camera_make')
+                photo.camera_make  = metadata.get('camera_make')
                 photo.camera_model = metadata.get('camera_model')
                 photo.image_quality = metadata.get('quality_score')
-                
-                # GPS coordinates
+
                 gps = metadata.get('gps')
                 if gps:
-                    photo.gps_latitude = gps.get('latitude')
+                    photo.gps_latitude  = gps.get('latitude')
                     photo.gps_longitude = gps.get('longitude')
-                
-                # Save detected objects
+
                 for obj in result.get('objects', []):
                     detected_obj = DetectedObject(
                         photo_id=photo.photo_id,
@@ -295,33 +304,58 @@ def process_photos():
                         color_name=obj.get('color_name', '')
                     )
                     session.add(detected_obj)
-                
-                # Collect face data for clustering
+
                 for face_data in result.get('faces', []):
                     all_faces_data.append({
-                        'photo_id': photo.photo_id,
-                        'photo_path': photo.path,
-                        'encoding': np.array(face_data['encoding']),
-                        'location': face_data['location'],
+                        'photo_id':     photo.photo_id,
+                        'photo_path':   photo.path,
+                        'encoding':     np.array(face_data['encoding']),
+                        'location':     face_data['location'],
                         'quality_score': face_data.get('quality_score', 0.5),
-                        'emotion': face_data.get('emotion', {})
+                        'emotion':      face_data.get('emotion', {})
                     })
-                
+
                 processed_count += 1
-                logger.info(f"✓ Processed {photo.filename}: {len(result.get('faces', []))} faces, {len(result.get('objects', []))} objects")
-                
+                logger.info(
+                    f"✓ Processed {photo.filename}: "
+                    f"{len(result.get('faces', []))} faces, "
+                    f"{len(result.get('objects', []))} objects"
+                )
+
             except Exception as e:
                 logger.error(f"Error saving data for {photo.filename}: {str(e)}")
                 continue
-        
-        # Commit photo updates and objects
+
         session.commit()
         logger.info(f"\n✓ Saved vision analysis for {processed_count} photos")
-        
-        # =====================================================================
-        # STEP 2: FACE CLUSTERING
-        # =====================================================================
-        
+
+        # =================================================================
+        # STEP 1b: ASSIGN OBJECT CLUSTERS
+        # ─────────────────────────────────────────────────────────────────
+        # Pass photo.location_type (e.g. "beach", "office", "dining")
+        # instead of photo.scene_type ("indoor"/"outdoor").
+        # SCENE_TO_CATEGORY maps specific location names, not indoor/outdoor.
+        # =================================================================
+        obj_cluster_svc = get_object_cluster_service()
+        for photo in photos:
+            db_objs = session.query(DetectedObject).filter_by(photo_id=photo.photo_id).all()
+            result_objects = [{'label': o.label, 'confidence': o.confidence} for o in db_objs]
+
+            categories = obj_cluster_svc.get_categories_for_photo(
+                detected_objects=result_objects,
+                scene_label=photo.location_type,   # specific location like "beach"/"kitchen"
+                weather=photo.weather,
+                face_count=photo.face_count or 0,
+            )
+            if categories:
+                obj_cluster_svc.assign_photo_to_clusters(session, photo.photo_id, categories)
+                logger.info(f"✓ Object clusters for {photo.filename}: {categories}")
+
+        session.commit()
+
+        # =================================================================
+        # STEP 2: FACE CLUSTERING  
+        # =================================================================
         if len(all_faces_data) == 0:
             session.close()
             logger.warning("No faces detected in any photos")
@@ -332,75 +366,105 @@ def process_photos():
                 'clusters': [],
                 'message': 'Photos processed but no faces detected'
             })
-        
-        logger.info(f"\n========================================")
+
+        logger.info(f"\n{'='*40}")
         logger.info(f"Clustering {len(all_faces_data)} faces")
-        logger.info(f"========================================")
-        
-        # Extract encodings and quality scores
-        encodings = [face['encoding'] for face in all_faces_data]
+        logger.info(f"{'='*40}")
+
+        encodings     = [face['encoding'] for face in all_faces_data]
         quality_scores = [face['quality_score'] for face in all_faces_data]
-        
-        # Cluster faces
+
         labels = face_service.cluster_faces(encodings, quality_scores, min_samples=1, eps=0.6)
-        
-        # Organize faces by cluster
-        clusters = {}
+
+        # ── Step 2a: group new faces by DBSCAN label ──
+        dbscan_groups = {}   # dbscan_label -> list of face dicts
         for idx, label in enumerate(labels):
-            if label == -1:  # Skip noise/outliers
+            if label == -1:
                 logger.debug(f"Outlier face at index {idx}")
                 continue
-            
-            cluster_id = f"cluster_{label}"
-            
+            dbscan_groups.setdefault(label, []).append(all_faces_data[idx])
+
+        logger.info(f"DBSCAN produced {len(dbscan_groups)} temporary groups")
+
+        # ── Step 2b: load existing cluster centroids from DB ──────────
+        existing_centroids = _load_existing_cluster_centroids(session)
+        logger.info(f"Loaded centroids for {len(existing_centroids)} existing clusters")
+
+        # ── Step 2c: map each DBSCAN group to a stable cluster ID ─────
+        # We also track centroids we've already assigned in this run so two
+        # different DBSCAN groups don't collapse into the same new cluster.
+        label_to_cluster_id = {}   # dbscan_label -> stable cluster_id
+        assigned_centroids  = dict(existing_centroids)  # copy; grows as we assign
+
+        for label, faces in dbscan_groups.items():
+            group_centroid = np.mean([f['encoding'] for f in faces], axis=0)
+            matched_id = _match_to_existing_cluster(group_centroid, assigned_centroids)
+
+            if matched_id:
+                logger.info(
+                    f"  DBSCAN group {label} → existing cluster '{matched_id}' "
+                    f"(dist < 0.55)"
+                )
+                label_to_cluster_id[label] = matched_id
+                # Update centroid to include new faces
+                assigned_centroids[matched_id] = np.mean(
+                    [assigned_centroids[matched_id], group_centroid], axis=0
+                )
+            else:
+                new_id = f"cluster_{uuid.uuid4().hex[:8]}"
+                logger.info(f"  DBSCAN group {label} → NEW cluster '{new_id}'")
+                label_to_cluster_id[label] = new_id
+                assigned_centroids[new_id] = group_centroid
+
+        # ── Step 2d: build final clusters dict using stable IDs ───────
+        clusters = {}
+        for label, faces in dbscan_groups.items():
+            cluster_id = label_to_cluster_id[label]
             if cluster_id not in clusters:
-                clusters[cluster_id] = {
-                    'faces': [],
-                    'photos': set()
-                }
-            
-            clusters[cluster_id]['faces'].append(all_faces_data[idx])
-            clusters[cluster_id]['photos'].add(all_faces_data[idx]['photo_id'])
-        
-        logger.info(f"✓ Created {len(clusters)} person clusters")
-        
-        # Save clusters to database
+                clusters[cluster_id] = {'faces': [], 'photos': set()}
+            clusters[cluster_id]['faces'].extend(faces)
+            for f in faces:
+                clusters[cluster_id]['photos'].add(f['photo_id'])
+
+        logger.info(f"✓ Resolved to {len(clusters)} stable person clusters")
+
+        # ── Step 2e: save clusters to DB ───
         for cluster_id, data in clusters.items():
-            # Find best quality face for thumbnail
             best_face = max(data['faces'], key=lambda x: x['quality_score'])
-            
-            logger.info(f"Cluster {cluster_id}: {len(data['faces'])} faces, best quality: {best_face['quality_score']:.2f}")
-            
-            # Create thumbnail from best face
+            logger.info(
+                f"Cluster {cluster_id}: {len(data['faces'])} faces, "
+                f"best quality: {best_face['quality_score']:.2f}"
+            )
+
             thumbnail_filename = f"{cluster_id}_thumb.jpg"
             thumbnail_path = os.path.join(THUMBNAILS_FOLDER, thumbnail_filename)
-            
             face_service.extract_face_thumbnail(
-                best_face['photo_path'],
-                best_face['location'],
-                thumbnail_path
+                best_face['photo_path'], best_face['location'], thumbnail_path
             )
-            
-            # Create or update cluster
-            cluster = session.query(Cluster).filter_by(cluster_id=cluster_id).first()
-            if not cluster:
-                cluster = Cluster(
+
+            cluster_obj = session.query(Cluster).filter_by(cluster_id=cluster_id).first()
+            if not cluster_obj:
+                # Brand-new cluster — assign a default name
+                cluster_number = session.query(Cluster).count() + 1
+                cluster_obj = Cluster(
                     cluster_id=cluster_id,
-                    name=f"Person {cluster_id.split('_')[1]}",
+                    name=f"Person {cluster_number}",
                     face_count=len(data['faces']),
                     thumbnail=thumbnail_filename,
-                    created_at=datetime.utcnow()    # ← matches DateTime column
+                    created_at=datetime.utcnow()
                 )
-                session.add(cluster)
+                session.add(cluster_obj)
             else:
-                cluster.face_count = len(data['faces'])
-                cluster.thumbnail = thumbnail_filename
-            
-            # FIX: Track which photo-cluster combinations we've already added
-            # to prevent duplicate key errors
+                # Existing cluster — only update counts/thumbnail, NOT the name
+                cluster_obj.face_count = (
+                    session.query(FaceEmbedding).filter_by(cluster_id=cluster_id).count()
+                    + len(data['faces'])
+                )
+                cluster_obj.thumbnail  = thumbnail_filename
+                cluster_obj.updated_at = datetime.utcnow()
+
             added_photo_clusters = set()
-            
-            # Save face embeddings with emotion and quality
+
             for face_data in data['faces']:
                 face_embedding = FaceEmbedding(
                     photo_id=face_data['photo_id'],
@@ -413,67 +477,55 @@ def process_photos():
                     quality_score=face_data['quality_score']
                 )
                 session.add(face_embedding)
-                
-                # FIX: Only add photo-cluster link if we haven't already added it
-                # This prevents duplicates when a photo has multiple faces of the same person
-                photo_cluster_key = (face_data['photo_id'], cluster_id)
-                if photo_cluster_key not in added_photo_clusters:
-                    # Check if it already exists in database
-                    existing = session.query(PhotoCluster).filter_by(
+
+                pk = (face_data['photo_id'], cluster_id)
+                if pk not in added_photo_clusters:
+                    existing_link = session.query(PhotoCluster).filter_by(
                         photo_id=face_data['photo_id'],
                         cluster_id=cluster_id
                     ).first()
-                    
-                    if not existing:
-                        photo_cluster = PhotoCluster(
+                    if not existing_link:
+                        session.add(PhotoCluster(
                             photo_id=face_data['photo_id'],
                             cluster_id=cluster_id
-                        )
-                        session.add(photo_cluster)
-                    
-                    added_photo_clusters.add(photo_cluster_key)
-        
+                        ))
+                    added_photo_clusters.add(pk)
+
         session.commit()
-        logger.info(f"✓ Saved all clusters and face embeddings")
-        
-        # Get cluster info for response
+        logger.info("✓ Saved all clusters and face embeddings")
+
+        # Build response
         clusters_list = session.query(Cluster).all()
-        cluster_info = []
-        
-        for cluster in clusters_list:
-            # Get photos for this cluster
-            photo_clusters = session.query(PhotoCluster).filter_by(
-                cluster_id=cluster.cluster_id
-            ).all()
-            
+        cluster_info  = []
+        for cl in clusters_list:
+            pcs = session.query(PhotoCluster).filter_by(cluster_id=cl.cluster_id).all()
             photos_in_cluster = []
-            for pc in photo_clusters:
+            for pc in pcs:
                 p = session.query(Photo).filter_by(photo_id=pc.photo_id).first()
                 if p:
                     photos_in_cluster.append({
                         'photo_id': p.photo_id,
                         'filename': p.filename,
-                        # 'path': p.filename  # Frontend expects filename
                         'path': f'uploads/{p.filename}'
                     })
-            
             cluster_info.append({
-                'cluster_id': cluster.cluster_id,
-                'name': cluster.name,
-                'face_count': cluster.face_count,
-                'thumbnail': cluster.thumbnail,
+                'cluster_id': cl.cluster_id,
+                'name': cl.name,
+                'face_count': cl.face_count,
+                'thumbnail': cl.thumbnail,
                 'photos': photos_in_cluster
             })
-        
+
         session.close()
-        
-        logger.info(f"\n========================================")
-        logger.info(f"✓ Processing complete!")
-        logger.info(f"  - Processed photos: {processed_count}")
-        logger.info(f"  - Total faces: {len(all_faces_data)}")
-        logger.info(f"  - Person clusters: {len(clusters)}")
-        logger.info(f"========================================\n")
-        
+        logger.info(
+            f"\n{'='*40}\n"
+            f"✓ Processing complete!\n"
+            f"  - Processed photos : {processed_count}\n"
+            f"  - Total faces      : {len(all_faces_data)}\n"
+            f"  - Person clusters  : {len(clusters)}\n"
+            f"{'='*40}\n"
+        )
+
         return jsonify({
             'success': True,
             'processed_photos': processed_count,
@@ -481,50 +533,36 @@ def process_photos():
             'clusters': cluster_info,
             'total_clusters': len(clusters)
         })
-        
+
     except Exception as e:
         logger.error(f"Processing error: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
 
+
+# ============================================================================
+# Original app.py
+# (clusters, rename, merge, delete, organize, stats, reset, search,
+#  chat, conversations, insights, memory, object-clusters …)
+# ============================================================================
+
 @app.route('/api/clusters', methods=['GET'])
 def get_clusters():
-    """Get all person clusters with their photos"""
     session = Session()
-    
     try:
         clusters = session.query(Cluster).all()
         cluster_list = []
-        
         for cluster in clusters:
-            # Get photos for this cluster via junction table
-            photo_clusters = session.query(PhotoCluster).filter_by(
-                cluster_id=cluster.cluster_id
-            ).all()
-            
+            photo_clusters = session.query(PhotoCluster).filter_by(cluster_id=cluster.cluster_id).all()
             photos = []
             for pc in photo_clusters:
                 photo = session.query(Photo).filter_by(photo_id=pc.photo_id).first()
                 if photo:
-                    photos.append({
-                        'photo_id': photo.photo_id,
-                        'filename': photo.filename,
-                        # 'path': photo.filename 
-                        'path': f'uploads/{photo.filename}'
-                    })
-            
-            cluster_list.append({
-                'cluster_id': cluster.cluster_id,
-                'name': cluster.name,
-                'face_count': cluster.face_count,
-                'thumbnail': cluster.thumbnail,
-                'photos': photos
-            })
-        
+                    photos.append({'photo_id': photo.photo_id, 'filename': photo.filename, 'path': f'uploads/{photo.filename}'})
+            cluster_list.append({'cluster_id': cluster.cluster_id, 'name': cluster.name, 'face_count': cluster.face_count, 'thumbnail': cluster.thumbnail, 'photos': photos})
         session.close()
         return jsonify({'clusters': cluster_list})
-        
     except Exception as e:
         session.close()
         logger.error(f"Error getting clusters: {str(e)}")
@@ -532,42 +570,20 @@ def get_clusters():
 
 @app.route('/api/cluster/<cluster_id>/photos', methods=['GET'])
 def get_cluster_photos(cluster_id):
-    """Get all photos for a specific person/cluster"""
     session = Session()
-    
     try:
-        # Get cluster info
         cluster = session.query(Cluster).filter_by(cluster_id=cluster_id).first()
-        
         if not cluster:
             session.close()
             return jsonify({'error': 'Cluster not found'}), 404
-        
-        # Get photos via junction table
-        photo_clusters = session.query(PhotoCluster).filter_by(
-            cluster_id=cluster_id
-        ).all()
-        
+        photo_clusters = session.query(PhotoCluster).filter_by(cluster_id=cluster_id).all()
         photos = []
         for pc in photo_clusters:
             photo = session.query(Photo).filter_by(photo_id=pc.photo_id).first()
             if photo:
-                photos.append({
-                    'photo_id': photo.photo_id,
-                    'filename': photo.filename,
-                    # 'path': photo.filename
-                    'path': f'uploads/{photo.filename}'
-                })
-        
+                photos.append({'photo_id': photo.photo_id, 'filename': photo.filename, 'path': f'uploads/{photo.filename}'})
         session.close()
-        
-        return jsonify({
-            'cluster_id': cluster_id,
-            'name': cluster.name,
-            'face_count': cluster.face_count,
-            'photos': photos
-        })
-        
+        return jsonify({'cluster_id': cluster_id, 'name': cluster.name, 'face_count': cluster.face_count, 'photos': photos})
     except Exception as e:
         session.close()
         logger.error(f"Error getting cluster photos: {str(e)}")
@@ -575,94 +591,58 @@ def get_cluster_photos(cluster_id):
 
 @app.route('/api/cluster/rename', methods=['POST'])
 def rename_cluster():
-    """Rename a person/cluster"""
     data = request.json
     cluster_id = data.get('cluster_id')
-    new_name = data.get('name')
-    
+    new_name   = data.get('name')
     if not cluster_id or not new_name:
         return jsonify({'error': 'Missing cluster_id or name'}), 400
-    
     session = Session()
-    
     try:
         cluster = session.query(Cluster).filter_by(cluster_id=cluster_id).first()
-        
         if not cluster:
             session.close()
             return jsonify({'error': 'Cluster not found'}), 404
-        
         cluster.name = new_name
         session.commit()
         session.close()
-        
         logger.info(f"✓ Renamed cluster {cluster_id} to '{new_name}'")
-        
         return jsonify({'success': True})
-        
     except Exception as e:
         session.rollback()
         session.close()
         logger.error(f"Error renaming cluster: {str(e)}")
         return jsonify({'error': str(e)}), 500
-    
+
 @app.route('/api/clusters/merge', methods=['POST'])
 def merge_clusters():
-    """
-    Merge source cluster INTO target cluster.
-    All faces and photos from source are moved to target, then source is deleted.
-    
-    Body: { "source_cluster_id": "cluster_2", "target_cluster_id": "cluster_0" }
-    """
-    data = request.json
+    data      = request.json
     source_id = data.get('source_cluster_id')
     target_id = data.get('target_cluster_id')
-
     if not source_id or not target_id:
         return jsonify({'error': 'Missing source_cluster_id or target_cluster_id'}), 400
     if source_id == target_id:
         return jsonify({'error': 'Source and target cannot be the same'}), 400
-
     session = Session()
     try:
         source = session.query(Cluster).filter_by(cluster_id=source_id).first()
         target = session.query(Cluster).filter_by(cluster_id=target_id).first()
-
         if not source or not target:
             session.close()
             return jsonify({'error': 'Cluster not found'}), 404
-
-        # 1. Re-point all FaceEmbeddings from source → target
-        session.query(FaceEmbedding).filter_by(cluster_id=source_id).update(
-            {'cluster_id': target_id}
-        )
-
-        # 2. Move PhotoCluster links, skip duplicates
+        session.query(FaceEmbedding).filter_by(cluster_id=source_id).update({'cluster_id': target_id})
         source_links = session.query(PhotoCluster).filter_by(cluster_id=source_id).all()
         for link in source_links:
-            already_exists = session.query(PhotoCluster).filter_by(
-                photo_id=link.photo_id,
-                cluster_id=target_id
-            ).first()
-            if not already_exists:
-                new_link = PhotoCluster(photo_id=link.photo_id, cluster_id=target_id)
-                session.add(new_link)
+            already = session.query(PhotoCluster).filter_by(photo_id=link.photo_id, cluster_id=target_id).first()
+            if not already:
+                session.add(PhotoCluster(photo_id=link.photo_id, cluster_id=target_id))
             session.delete(link)
-
-        # 3. Update target face count
-        new_face_count = session.query(FaceEmbedding).filter_by(cluster_id=target_id).count()
-        new_photo_count = session.query(PhotoCluster).filter_by(cluster_id=target_id).count()
-        target.face_count = new_face_count
-        target.photo_count = new_photo_count
-        target.updated_at = datetime.utcnow()
-
-        # 4. Delete source cluster
+        target.face_count  = session.query(FaceEmbedding).filter_by(cluster_id=target_id).count()
+        target.photo_count = session.query(PhotoCluster).filter_by(cluster_id=target_id).count()
+        target.updated_at  = datetime.utcnow()
         session.delete(source)
         session.commit()
-
         logger.info(f"✓ Merged cluster {source_id} into {target_id}")
         return jsonify({'success': True, 'merged_into': target_id})
-
     except Exception as e:
         session.rollback()
         logger.error(f"Merge error: {str(e)}")
@@ -670,33 +650,22 @@ def merge_clusters():
     finally:
         session.close()
 
-
 @app.route('/api/clusters/<cluster_id>', methods=['DELETE'])
 def delete_cluster(cluster_id):
-    """
-    Delete a cluster and all its face embeddings and photo links.
-    Does NOT delete the photos themselves.
-    """
     session = Session()
     try:
         cluster = session.query(Cluster).filter_by(cluster_id=cluster_id).first()
         if not cluster:
             session.close()
             return jsonify({'error': 'Cluster not found'}), 404
-
-        # Cascade handles FaceEmbedding + PhotoCluster deletions
-        session.delete(cluster)
-
-        # Also delete thumbnail file if it exists
         if cluster.thumbnail:
             thumb_path = os.path.join(THUMBNAILS_FOLDER, cluster.thumbnail)
             if os.path.exists(thumb_path):
                 os.remove(thumb_path)
-
+        session.delete(cluster)
         session.commit()
         logger.info(f"✓ Deleted cluster {cluster_id}")
         return jsonify({'success': True})
-
     except Exception as e:
         session.rollback()
         logger.error(f"Delete cluster error: {str(e)}")
@@ -704,45 +673,24 @@ def delete_cluster(cluster_id):
     finally:
         session.close()
 
-
 @app.route('/api/clusters/<cluster_id>/photos/<photo_id>', methods=['DELETE'])
 def remove_photo_from_cluster(cluster_id, photo_id):
-    """
-    Remove a single photo from a cluster.
-    Deletes the PhotoCluster link and all FaceEmbeddings for this photo+cluster pair.
-    Does NOT delete the photo itself.
-    """
     session = Session()
     try:
-        # Delete the junction row
-        link = session.query(PhotoCluster).filter_by(
-            cluster_id=cluster_id, photo_id=photo_id
-        ).first()
+        link = session.query(PhotoCluster).filter_by(cluster_id=cluster_id, photo_id=photo_id).first()
         if not link:
             session.close()
             return jsonify({'error': 'Photo not in this cluster'}), 404
         session.delete(link)
-
-        # Delete face embeddings for this photo in this cluster
-        session.query(FaceEmbedding).filter_by(
-            cluster_id=cluster_id, photo_id=photo_id
-        ).delete()
-
-        # Update cluster face/photo count
+        session.query(FaceEmbedding).filter_by(cluster_id=cluster_id, photo_id=photo_id).delete()
         cluster = session.query(Cluster).filter_by(cluster_id=cluster_id).first()
         if cluster:
-            cluster.face_count = session.query(FaceEmbedding).filter_by(
-                cluster_id=cluster_id
-            ).count()
-            cluster.photo_count = session.query(PhotoCluster).filter_by(
-                cluster_id=cluster_id
-            ).count()
-            cluster.updated_at = datetime.utcnow()
-
+            cluster.face_count  = session.query(FaceEmbedding).filter_by(cluster_id=cluster_id).count()
+            cluster.photo_count = session.query(PhotoCluster).filter_by(cluster_id=cluster_id).count()
+            cluster.updated_at  = datetime.utcnow()
         session.commit()
         logger.info(f"✓ Removed photo {photo_id} from cluster {cluster_id}")
         return jsonify({'success': True})
-
     except Exception as e:
         session.rollback()
         logger.error(f"Remove photo error: {str(e)}")
@@ -752,44 +700,24 @@ def remove_photo_from_cluster(cluster_id, photo_id):
 
 @app.route('/api/organize', methods=['POST'])
 def organize_photos():
-    """
-    Organize photos into folders by person/cluster
-    Photos with multiple people will be copied to multiple folders
-    """
     session = Session()
-    
     try:
         clusters = session.query(Cluster).all()
         organized_count = 0
-        
         for cluster in clusters:
-            # Create folder for this person
             person_folder = os.path.join(ORGANIZED_FOLDER, cluster.name)
             os.makedirs(person_folder, exist_ok=True)
-            
-            # Get photos for this cluster
-            photo_clusters = session.query(PhotoCluster).filter_by(
-                cluster_id=cluster.cluster_id
-            ).all()
-            
+            photo_clusters = session.query(PhotoCluster).filter_by(cluster_id=cluster.cluster_id).all()
             for pc in photo_clusters:
                 photo = session.query(Photo).filter_by(photo_id=pc.photo_id).first()
                 if photo and os.path.exists(photo.path):
                     dest_path = os.path.join(person_folder, photo.filename)
-                    if not os.path.exists(dest_path):  # Avoid duplicates
+                    if not os.path.exists(dest_path):
                         shutil.copy2(photo.path, dest_path)
                         organized_count += 1
-        
         session.close()
-        
         logger.info(f"✓ Organized {organized_count} photos into folders")
-        
-        return jsonify({
-            'success': True,
-            'organized_count': organized_count,
-            'output_folder': ORGANIZED_FOLDER
-        })
-        
+        return jsonify({'success': True, 'organized_count': organized_count, 'output_folder': ORGANIZED_FOLDER})
     except Exception as e:
         session.close()
         logger.error(f"Error organizing photos: {str(e)}")
@@ -797,26 +725,18 @@ def organize_photos():
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
-    """Get statistics about the photo library"""
     session = Session()
-    
     try:
         stats = {
-            'total_photos': session.query(Photo).count(),
-            'total_clusters': session.query(Cluster).count(),
-            'processed_faces': session.query(FaceEmbedding).count(),
-            'detected_objects': session.query(DetectedObject).count(),
-            'photos_with_emotions': session.query(Photo).filter(
-                Photo.dominant_emotion != None
-            ).count(),
-            'photos_with_scenes': session.query(Photo).filter(
-                Photo.scene_type != None
-            ).count()
+            'total_photos':          session.query(Photo).count(),
+            'total_clusters':        session.query(Cluster).count(),
+            'processed_faces':       session.query(FaceEmbedding).count(),
+            'detected_objects':      session.query(DetectedObject).count(),
+            'photos_with_emotions':  session.query(Photo).filter(Photo.dominant_emotion != None).count(),
+            'photos_with_scenes':    session.query(Photo).filter(Photo.scene_type != None).count()
         }
-        
         session.close()
         return jsonify(stats)
-        
     except Exception as e:
         session.close()
         logger.error(f"Error getting stats: {str(e)}")
@@ -824,14 +744,8 @@ def get_stats():
 
 @app.route('/api/reset', methods=['POST'])
 def reset_database():
-    """
-    Reset all data (for testing/development)
-    WARNING: This deletes everything!
-    """
     session = Session()
-    
     try:
-        # Delete all records (cascade will handle relationships)
         session.query(PhotoCluster).delete()
         session.query(FaceEmbedding).delete()
         session.query(DetectedObject).delete()
@@ -839,414 +753,153 @@ def reset_database():
         session.query(Photo).delete()
         session.commit()
         session.close()
-        
-        # Clear folders
         for folder in [UPLOAD_FOLDER, THUMBNAILS_FOLDER, ORGANIZED_FOLDER]:
             if os.path.exists(folder):
                 shutil.rmtree(folder)
             os.makedirs(folder, exist_ok=True)
-        
         logger.info("✓ Database reset complete")
-        
-        return jsonify({
-            'success': True,
-            'message': 'All data reset'
-        })
-        
+        return jsonify({'success': True, 'message': 'All data reset'})
     except Exception as e:
         session.rollback()
         session.close()
         logger.error(f"Error resetting database: {str(e)}")
         return jsonify({'error': str(e)}), 500
-    
+
 @app.route('/api/search', methods=['POST'])
 def search_photos():
-    """
-    Natural language photo search with hybrid retrieval
-    
-    Request body:
-        {
-            "query": "beach photos with Mom from last summer",
-            "top_k": 10,
-            "use_filters": true
-        }
-    
-    Returns: List of retrieved photos with similarity scores
-    """
     if not SERVICES_AVAILABLE:
         return jsonify({'error': 'Services not available'}), 500
-    
     try:
-        data = request.json
-        query = data.get('query', '')
-        top_k = data.get('top_k', 10)
+        data        = request.json
+        query       = data.get('query', '')
+        top_k       = data.get('top_k', 10)
         use_filters = data.get('use_filters', True)
-        
         if not query:
             return jsonify({'error': 'Query is required'}), 400
-        
-        logger.info(f"=== SEARCH REQUEST ===")
-        logger.info(f"Query: {query}")
-        logger.info(f"Top K: {top_k}")
-        logger.info(f"Use filters: {use_filters}")
-        
-        # Get services
-        query_service = get_query_service()
+        logger.info(f"=== SEARCH REQUEST ===\nQuery: {query}")
+        query_service     = get_query_service()
         retrieval_service = get_retrieval_service()
-        
-        # Step 1: Parse query into structured filters
-        session = Session()
-        clusters = session.query(Cluster).all()
-        known_people = [c.name for c in clusters]
+        session           = Session()
+        clusters          = session.query(Cluster).all()
+        known_people      = [c.name for c in clusters]
         session.close()
-        
-        parser = get_query_parser(known_people)
-        parsed_filters = parser.parse(query)
-        
-        logger.info(f"Parsed filters: {parsed_filters}")
-        
-        # Step 2: Generate query embedding
+        parser          = get_query_parser(known_people)
+        parsed_filters  = parser.parse(query)
         query_embedding = query_service.encode_query(query)
-        
         if query_embedding is None:
             return jsonify({'error': 'Failed to encode query'}), 500
-        
-        # Step 3: Perform hybrid search
-        if use_filters and len(parsed_filters) > 1:  # Has filters beyond raw_query
-            # Remove raw_query from filters for database search
+        if use_filters and len(parsed_filters) > 1:
             db_filters = {k: v for k, v in parsed_filters.items() if k != 'raw_query'}
-            results = retrieval_service.hybrid_search(
-                query_embedding,
-                filters=db_filters,
-                top_k=top_k
-            )
+            results = retrieval_service.hybrid_search(query_embedding, filters=db_filters, top_k=top_k)
         else:
-            # Pure semantic search
-            results = retrieval_service.semantic_search(
-                query_embedding,
-                top_k=top_k,
-                min_similarity=0.3
-            )
-        
+            results = retrieval_service.semantic_search(query_embedding, top_k=top_k, min_similarity=0.3)
         logger.info(f"✓ Retrieved {len(results)} photos")
-        
-        return jsonify({
-            'success': True,
-            'query': query,
-            'parsed_filters': parsed_filters,
-            'results_count': len(results),
-            'results': results
-        })
-        
+        return jsonify({'success': True, 'query': query, 'parsed_filters': parsed_filters, 'results_count': len(results), 'results': results})
     except Exception as e:
         logger.error(f"Search error: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
+        import traceback; logger.error(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
-
 
 @app.route('/api/search/context', methods=['POST'])
 def get_search_context():
-    """
-    Get LLM-ready context for search results
-    
-    Request body:
-        {
-            "query": "beach photos with Mom",
-            "top_k": 10,
-            "include_system_prompt": true
-        }
-    
-    Returns: Formatted context string ready for LLM
-    """
     if not SERVICES_AVAILABLE:
         return jsonify({'error': 'Services not available'}), 500
-    
     try:
-        data = request.json
-        query = data.get('query', '')
-        top_k = data.get('top_k', 10)
+        data                 = request.json
+        query                = data.get('query', '')
+        top_k                = data.get('top_k', 10)
         include_system_prompt = data.get('include_system_prompt', True)
-        
         if not query:
             return jsonify({'error': 'Query is required'}), 400
-        
-        # Get services
-        query_service = get_query_service()
+        query_service     = get_query_service()
         retrieval_service = get_retrieval_service()
-        context_service = get_context_service()
-        
-        # Parse query
-        session = Session()
-        clusters = session.query(Cluster).all()
-        known_people = [c.name for c in clusters]
+        context_service   = get_context_service()
+        session           = Session()
+        clusters          = session.query(Cluster).all()
+        known_people      = [c.name for c in clusters]
         session.close()
-        
-        parser = get_query_parser(known_people)
-        parsed_filters = parser.parse(query)
-        
-        # Generate embedding
+        parser          = get_query_parser(known_people)
+        parsed_filters  = parser.parse(query)
         query_embedding = query_service.encode_query(query)
-        
         if query_embedding is None:
             return jsonify({'error': 'Failed to encode query'}), 500
-        
-        # Search
         db_filters = {k: v for k, v in parsed_filters.items() if k != 'raw_query'}
-        results = retrieval_service.hybrid_search(
-            query_embedding,
-            filters=db_filters,
-            top_k=top_k
-        )
-        
-        # Build context
-        context = context_service.build_context(
-            results,
-            query,
-            include_system_prompt=include_system_prompt
-        )
-        
-        estimated_tokens = context_service.estimate_tokens(context)
-        
-        logger.info(f"✓ Built context: {len(results)} photos, ~{estimated_tokens} tokens")
-        
-        return jsonify({
-            'success': True,
-            'query': query,
-            'results_count': len(results),
-            'context': context,
-            'estimated_tokens': estimated_tokens
-        })
-        
+        results    = retrieval_service.hybrid_search(query_embedding, filters=db_filters, top_k=top_k)
+        context    = context_service.build_context(results, query, include_system_prompt=include_system_prompt)
+        return jsonify({'success': True, 'query': query, 'results_count': len(results), 'context': context, 'estimated_tokens': context_service.estimate_tokens(context)})
     except Exception as e:
         logger.error(f"Context generation error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/search/similar/<photo_id>', methods=['GET'])
 def find_similar_photos(photo_id):
-    """
-    Find photos similar to a given photo
-    
-    URL params:
-        - top_k: Number of results (default: 10)
-    
-    Returns: List of similar photos
-    """
     if not SERVICES_AVAILABLE:
         return jsonify({'error': 'Services not available'}), 500
-    
     try:
-        top_k = request.args.get('top_k', 10, type=int)
-        
+        top_k             = request.args.get('top_k', 10, type=int)
         retrieval_service = get_retrieval_service()
-        
-        results = retrieval_service.search_by_similar_photo(
-            photo_id,
-            top_k=top_k,
-            exclude_self=True
-        )
-        
-        logger.info(f"✓ Found {len(results)} similar photos to {photo_id}")
-        
-        return jsonify({
-            'success': True,
-            'reference_photo_id': photo_id,
-            'results_count': len(results),
-            'results': results
-        })
-        
+        results           = retrieval_service.search_by_similar_photo(photo_id, top_k=top_k, exclude_self=True)
+        return jsonify({'success': True, 'reference_photo_id': photo_id, 'results_count': len(results), 'results': results})
     except Exception as e:
         logger.error(f"Similar photo search error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/insights/summary', methods=['POST'])
 def generate_summary():
-    """
-    Generate aggregated summary/insights from photos
-    
-    Request body:
-        {
-            "filters": {...},  # Optional filters
-            "summary_type": "general"  # "general", "emotional", "temporal", "people"
-        }
-    
-    Returns: Summary context for LLM
-    """
     if not SERVICES_AVAILABLE:
         return jsonify({'error': 'Services not available'}), 500
-    
     try:
-        data = request.json
-        filters = data.get('filters', {})
+        data         = request.json
         summary_type = data.get('summary_type', 'general')
-        
-        # Get all photos or filtered subset
-        session = Session()
-        query = session.query(Photo).filter(Photo.clip_embedding.isnot(None))
-        
-        # Apply filters if provided
-        # (You can expand this to apply filters similar to hybrid search)
-        
-        photos = query.limit(100).all()  # Limit for performance
-        
-        # Convert to dict format
-        photo_dicts = []
+        session      = Session()
+        photos       = session.query(Photo).filter(Photo.clip_embedding.isnot(None)).limit(100).all()
+        photo_dicts  = []
         for photo in photos:
-            # Get people
-            photo_clusters = session.query(PhotoCluster).filter_by(
-                photo_id=photo.photo_id
-            ).all()
-            
+            pcs    = session.query(PhotoCluster).filter_by(photo_id=photo.photo_id).all()
             people = []
-            for pc in photo_clusters:
-                cluster = session.query(Cluster).filter_by(
-                    cluster_id=pc.cluster_id
-                ).first()
-                if cluster:
-                    people.append(cluster.name)
-            
-            photo_dicts.append({
-                'photo_id': photo.photo_id,
-                'people': people,
-                'dominant_emotion': photo.dominant_emotion,
-                'location': photo.location_type,
-                'activity': photo.activity,
-                'season': photo.season,
-                'time_of_day': photo.time_of_day
-            })
-        
+            for pc in pcs:
+                cl = session.query(Cluster).filter_by(cluster_id=pc.cluster_id).first()
+                if cl:
+                    people.append(cl.name)
+            photo_dicts.append({'photo_id': photo.photo_id, 'people': people, 'dominant_emotion': photo.dominant_emotion, 'location': photo.location_type, 'activity': photo.activity, 'season': photo.season, 'time_of_day': photo.time_of_day})
         session.close()
-        
-        # Generate summary
         context_service = get_context_service()
-        summary = context_service.build_summary_context(
-            photo_dicts,
-            summary_type=summary_type
-        )
-        
-        logger.info(f"✓ Generated {summary_type} summary for {len(photo_dicts)} photos")
-        
-        return jsonify({
-            'success': True,
-            'summary_type': summary_type,
-            'photos_analyzed': len(photo_dicts),
-            'summary': summary
-        })
-        
+        summary         = context_service.build_summary_context(photo_dicts, summary_type=summary_type)
+        return jsonify({'success': True, 'summary_type': summary_type, 'photos_analyzed': len(photo_dicts), 'summary': summary})
     except Exception as e:
         logger.error(f"Summary generation error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/retrieval/stats', methods=['GET'])
 def retrieval_stats():
-    """Get retrieval system statistics"""
     if not SERVICES_AVAILABLE:
         return jsonify({'error': 'Services not available'}), 500
-    
     try:
         retrieval_service = get_retrieval_service()
-        query_service = get_query_service()
-        
-        stats = retrieval_service.get_retrieval_stats()
-        cache_stats = query_service.get_cache_stats()
-        
-        return jsonify({
-            'success': True,
-            'retrieval_stats': stats,
-            'cache_stats': cache_stats
-        })
-        
+        query_service     = get_query_service()
+        return jsonify({'success': True, 'retrieval_stats': retrieval_service.get_retrieval_stats(), 'cache_stats': query_service.get_cache_stats()})
     except Exception as e:
         logger.error(f"Stats error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/query/parse', methods=['POST'])
 def parse_query():
-    """
-    Test endpoint: Parse a query and show extracted filters
-    
-    Useful for debugging query parsing
-    
-    Request body:
-        {
-            "query": "beach photos with Mom from last summer"
-        }
-    
-    Returns: Parsed filters
-    """
     try:
-        data = request.json
+        data  = request.json
         query = data.get('query', '')
-        
         if not query:
             return jsonify({'error': 'Query is required'}), 400
-        
-        # Get known people
-        session = Session()
-        clusters = session.query(Cluster).all()
+        session      = Session()
+        clusters     = session.query(Cluster).all()
         known_people = [c.name for c in clusters]
         session.close()
-        
-        # Parse
-        parser = get_query_parser(known_people)
-        filters = parser.parse(query)
-        
-        # Get semantic query reconstruction
+        parser         = get_query_parser(known_people)
+        filters        = parser.parse(query)
         semantic_query = parser.get_semantic_query(filters)
-        
-        return jsonify({
-            'success': True,
-            'original_query': query,
-            'parsed_filters': filters,
-            'semantic_query': semantic_query,
-            'known_people': known_people
-        })
-        
+        return jsonify({'success': True, 'original_query': query, 'parsed_filters': filters, 'semantic_query': semantic_query, 'known_people': known_people})
     except Exception as e:
         logger.error(f"Query parsing error: {str(e)}")
         return jsonify({'error': str(e)}), 500
-
-
-# ============================================================================
-# Example: Complete search workflow
-# ============================================================================
-"""
-USAGE EXAMPLE:
-
-1. Simple search:
-POST /api/search
-{
-    "query": "beach photos with Mom",
-    "top_k": 10
-}
-
-2. Get LLM context:
-POST /api/search/context
-{
-    "query": "show me happy family photos from last summer",
-    "top_k": 5,
-    "include_system_prompt": true
-}
-
-3. Find similar photos:
-GET /api/search/similar/photo_123?top_k=10
-
-4. Generate insights:
-POST /api/insights/summary
-{
-    "summary_type": "emotional"
-}
-
-5. Test query parsing:
-POST /api/query/parse
-{
-    "query": "photos where I'm wearing a red dress at the beach"
-}
-"""
 
 # ============================================================================
 # CHAT / LLM ROUTES
@@ -1254,971 +907,407 @@ POST /api/query/parse
 
 @app.route('/api/chat', methods=['POST'])
 def chat(custom_data=None):
-    """
-    Unified Endpoint: Handles both Standard and Streaming requests.
-    """
     if not SERVICES_AVAILABLE:
         return jsonify({'error': 'Services not available'}), 500
-    
     try:
-        # 1. Setup Data
-        data = custom_data if custom_data else request.json
-        message = data.get('message', '')
-        conversation_id = data.get('conversation_id')
-        top_k = data.get('top_k', 5)
-        use_streaming = data.get('stream', False)
-        
+        data              = custom_data if custom_data else request.json
+        message           = data.get('message', '')
+        conversation_id   = data.get('conversation_id')
+        top_k             = data.get('top_k', 5)
+        use_streaming     = data.get('stream', False)
         if not message:
             return jsonify({'error': 'Message is required'}), 400
-        
-        logger.info(f"=== CHAT REQUEST ===")
-        logger.info(f"Message: {message}")
-        logger.info(f"Conversation: {conversation_id}")
-        
-        # 2. Get Services & Session
-        query_service = get_query_service()
-        retrieval_service = get_retrieval_service()
-        context_service = get_context_service()
-        llm_service = get_llm_service()
+        logger.info(f"=== CHAT REQUEST ===\nMessage: {message}\nConversation: {conversation_id}")
+        query_service        = get_query_service()
+        retrieval_service    = get_retrieval_service()
+        context_service      = get_context_service()
+        llm_service          = get_llm_service()
         conversation_service = get_conversation_service()
-        
-        session = Session()
-
-        # 3. FIXED: Handle conversation ID properly
+        session              = Session()
         if not conversation_id:
-            # Create new random ID
             conversation_id = conversation_service.create_conversation(session)
             logger.info(f"Created new conversation: {conversation_id}")
         elif conversation_id == 'default':
-            # Check if default exists, create if not
             from models import Conversation
             existing = session.query(Conversation).filter_by(conversation_id='default').first()
             if not existing:
-                # Manually create the 'default' conversation
-                default_conversation = Conversation(
-                    conversation_id='default',
-                    created_at=time.time(),
-                    updated_at=time.time()
-                )
+                default_conversation = Conversation(conversation_id='default', created_at=time.time(), updated_at=time.time())
                 session.add(default_conversation)
                 session.commit()
-                logger.info("Created default conversation")
-        
-        # 4. Parse query
-        clusters = session.query(Cluster).all()
+        clusters     = session.query(Cluster).all()
         known_people = [c.name for c in clusters]
-        
-        parser = get_query_parser(known_people)
+        parser         = get_query_parser(known_people)
         parsed_filters = parser.parse(message)
-        
         logger.info(f"Parsed filters: {parsed_filters}")
-        
-        # 5. Generate query embedding
         query_embedding = query_service.encode_query(message)
         if query_embedding is None:
             session.close()
             return jsonify({'error': 'Failed to encode query'}), 500
-        
-        # 6. Retrieve photos
         db_filters = {k: v for k, v in parsed_filters.items() if k != 'raw_query'}
-        retrieved_photos = retrieval_service.hybrid_search(
-            query_embedding, filters=db_filters, top_k=top_k
-        )
-        
-        logger.info(f"✓ Retrieved {len(retrieved_photos)} photos")
-        
-        # 7. Build context
-        photo_context = context_service.build_context(
-            retrieved_photos, message, include_system_prompt=False
-        )
-        
-        # 8. Include conversation history
-        full_context = conversation_service.build_context_with_history(
-            session, conversation_id, message, photo_context
-        )
-        
-        # 9. Save user message
-        photo_ids = [p['photo_id'] for p in retrieved_photos]
-        conversation_service.add_message(
-            session, conversation_id, role='user', content=message,
-            retrieved_photo_ids=photo_ids,
-            metadata={'filters': parsed_filters, 'results_count': len(retrieved_photos)}
-        )
-
-        # 10. CRITICAL: Commit before streaming to save user message
-        session.commit()
-
-        # 11. Generate Response (Stream or Standard)
-        if use_streaming:
-            session.close()  # Safe to close now because we committed above
-            return Response(
-                stream_chat_response(
-                    llm_service, conversation_service, conversation_id,
-                    full_context, message, retrieved_photos
-                ),
-                mimetype='text/event-stream'
-            )
+        if db_filters:
+            retrieved_photos = retrieval_service.hybrid_search(query_embedding, filters=db_filters, top_k=top_k)
         else:
-            # Standard (non-streaming) response
+            retrieved_photos = retrieval_service.semantic_search(query_embedding, top_k=top_k, min_similarity=0.25)
+        logger.info(f"✓ Retrieved {len(retrieved_photos)} photos")
+        photo_context = context_service.build_context(retrieved_photos, message, include_system_prompt=False)
+        full_context  = conversation_service.build_context_with_history(session, conversation_id, message, photo_context)
+        photo_ids     = [p['photo_id'] for p in retrieved_photos]
+        conversation_service.add_message(session, conversation_id, role='user', content=message, retrieved_photo_ids=photo_ids, metadata={'filters': parsed_filters, 'results_count': len(retrieved_photos)})
+        session.commit()
+        if use_streaming:
+            session.close()
+            return Response(stream_chat_response(llm_service, conversation_service, conversation_id, full_context, message, retrieved_photos), mimetype='text/event-stream')
+        else:
             response_text = llm_service.generate_response(context=full_context, query=message)
-            validation = llm_service.validate_response(response_text, full_context)
-            
-            conversation_service.add_message(
-                session, conversation_id, role='assistant', content=response_text,
-                metadata={'validation': validation}
-            )
+            validation    = llm_service.validate_response(response_text, full_context)
+            conversation_service.add_message(session, conversation_id, role='assistant', content=response_text, metadata={'validation': validation})
             session.commit()
             session.close()
-            
             logger.info(f"✓ Generated response ({len(response_text)} chars)")
-            
-            return jsonify({
-                'success': True,
-                'conversation_id': conversation_id,
-                'message': message,
-                'response': response_text,
-                'retrieved_photos': retrieved_photos,
-                'validation': validation
-            })
-
+            return jsonify({'success': True, 'conversation_id': conversation_id, 'message': message, 'response': response_text, 'retrieved_photos': retrieved_photos, 'validation': validation})
     except Exception as e:
         logger.error(f"Chat error: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
+        import traceback; logger.error(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
 
-
-"""
-
-FIX: Added session.commit() before session.close().
-     Without it, the assistant message was added to the session but never
-     persisted; the DB row was silently discarded on close().
-"""
-
 def stream_chat_response(llm_service, conversation_service, conversation_id, context, query, retrieved_photos):
-    """
-    Generator for streaming chat responses.
-    Yields Server-Sent Events (SSE) format.
-    """
     full_response = []
-
     try:
-        # First, send retrieved photos
         yield f"data: {json.dumps({'type': 'photos', 'photos': retrieved_photos})}\n\n"
-
-        # Stream LLM response token by token
         for chunk in llm_service.generate_streaming_response(context, query):
             full_response.append(chunk)
             yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
-
-        # Persist the complete assistant response
         response_text = ''.join(full_response)
-
         session = Session()
-        conversation_service.add_message(
-            session,
-            conversation_id,
-            role='assistant',
-            content=response_text
-        )
-        session.commit()   # FIX: was missing — message was never persisted
+        conversation_service.add_message(session, conversation_id, role='assistant', content=response_text)
+        session.commit()
         session.close()
-
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
-
     except Exception as e:
         logger.error(f"Streaming error: {str(e)}")
         yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
 
 @app.route('/api/chat/stream', methods=['POST'])
 def chat_stream():
-    """
-    Streaming chat endpoint (alias for chat with stream=true)
-    """
-    # Get the data normally
     data = request.get_json() or {}
-    
-    # Force stream to True
     data['stream'] = True
-    
-    # Pass the data directly to the updated chat function
     return chat(custom_data=data)
-
 
 @app.route('/api/conversations', methods=['GET'])
 def get_conversations():
-    """
-    Get all conversations
-    
-    Query params:
-        - limit: Max conversations to return (default: 20)
-    """
     try:
-        limit = request.args.get('limit', 20, type=int)
-        
-        session = Session()
+        limit                = request.args.get('limit', 20, type=int)
+        session              = Session()
         conversation_service = get_conversation_service()
-        
-        conversations = conversation_service.get_all_conversations(
-            session,
-            limit=limit
-        )
-        
+        conversations        = conversation_service.get_all_conversations(session, limit=limit)
         session.close()
-        
-        return jsonify({
-            'success': True,
-            'conversations': conversations
-        })
-        
+        return jsonify({'success': True, 'conversations': conversations})
     except Exception as e:
         logger.error(f"Error getting conversations: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/conversation/<conversation_id>', methods=['GET'])
 def get_conversation(conversation_id):
-    """Get conversation history"""
     try:
-        session = Session()
+        session              = Session()
         conversation_service = get_conversation_service()
-        
-        # Get messages
-        history = conversation_service.get_conversation_history(
-            session,
-            conversation_id
-        )
-        
-        # Get stats
-        stats = conversation_service.get_conversation_stats(
-            session,
-            conversation_id
-        )
-        
+        history = conversation_service.get_conversation_history(session, conversation_id)
+        stats   = conversation_service.get_conversation_stats(session, conversation_id)
         session.close()
-        
-        return jsonify({
-            'success': True,
-            'conversation_id': conversation_id,
-            'messages': history,
-            'stats': stats
-        })
-        
+        return jsonify({'success': True, 'conversation_id': conversation_id, 'messages': history, 'stats': stats})
     except Exception as e:
         logger.error(f"Error getting conversation: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/conversation/new', methods=['POST'])
 def new_conversation():
-    """Start a new conversation"""
     try:
-        session = Session()
+        session              = Session()
         conversation_service = get_conversation_service()
-        
-        conversation_id = conversation_service.create_conversation(session)
-        
+        conversation_id      = conversation_service.create_conversation(session)
         session.close()
-        
-        return jsonify({
-            'success': True,
-            'conversation_id': conversation_id
-        })
-        
+        return jsonify({'success': True, 'conversation_id': conversation_id})
     except Exception as e:
         logger.error(f"Error creating conversation: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/conversation/<conversation_id>', methods=['DELETE'])
 def delete_conversation(conversation_id):
-    """Delete a conversation"""
     try:
-        session = Session()
+        session              = Session()
         conversation_service = get_conversation_service()
-        
-        success = conversation_service.delete_conversation(
-            session,
-            conversation_id
-        )
-        
+        success              = conversation_service.delete_conversation(session, conversation_id)
         session.close()
-        
         if success:
-            return jsonify({
-                'success': True,
-                'message': f'Conversation {conversation_id} deleted'
-            })
-        else:
-            return jsonify({'error': 'Failed to delete conversation'}), 500
-        
+            return jsonify({'success': True, 'message': f'Conversation {conversation_id} deleted'})
+        return jsonify({'error': 'Failed to delete conversation'}), 500
     except Exception as e:
         logger.error(f"Error deleting conversation: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/insights', methods=['POST'])
 def generate_insights():
-    """
-    Generate insights from photo collection
-    
-    Request body:
-        {
-            "insight_type": "emotional",  // emotional, social, temporal, general
-            "filters": {...}  // optional filters
-        }
-    """
     if not SERVICES_AVAILABLE:
         return jsonify({'error': 'Services not available'}), 500
-    
     try:
-        data = request.json
+        data         = request.json
         insight_type = data.get('insight_type', 'general')
-        filters = data.get('filters', {})
-        
-        # Get photos
-        session = Session()
-        query = session.query(Photo).filter(Photo.clip_embedding.isnot(None))
-        photos = query.limit(100).all()
-        
-        # Convert to dicts
-        photo_dicts = []
+        session      = Session()
+        photos       = session.query(Photo).filter(Photo.clip_embedding.isnot(None)).limit(100).all()
+        photo_dicts  = []
         for photo in photos:
-            photo_clusters = session.query(PhotoCluster).filter_by(
-                photo_id=photo.photo_id
-            ).all()
-            
+            pcs    = session.query(PhotoCluster).filter_by(photo_id=photo.photo_id).all()
             people = []
-            for pc in photo_clusters:
-                cluster = session.query(Cluster).filter_by(
-                    cluster_id=pc.cluster_id
-                ).first()
-                if cluster:
-                    people.append(cluster.name)
-            
-            photo_dicts.append({
-                'photo_id': photo.photo_id,
-                'people': people,
-                'dominant_emotion': photo.dominant_emotion,
-                'location': photo.location_type,
-                'activity': photo.activity,
-                'season': photo.season,
-                'time_of_day': photo.time_of_day
-            })
-        
-        # Generate summary context
+            for pc in pcs:
+                cl = session.query(Cluster).filter_by(cluster_id=pc.cluster_id).first()
+                if cl:
+                    people.append(cl.name)
+            photo_dicts.append({'photo_id': photo.photo_id, 'people': people, 'dominant_emotion': photo.dominant_emotion, 'location': photo.location_type, 'activity': photo.activity, 'season': photo.season, 'time_of_day': photo.time_of_day})
         context_service = get_context_service()
-        summary = context_service.build_summary_context(
-            photo_dicts,
-            summary_type=insight_type
-        )
-        
-        # Generate insights with LLM
-        llm_service = get_llm_service()
-        insights = llm_service.generate_insight(
-            summary_context=summary,
-            insight_type=insight_type
-        )
-        
+        summary         = context_service.build_summary_context(photo_dicts, summary_type=insight_type)
+        llm_service     = get_llm_service()
+        insights        = llm_service.generate_insight(summary_context=summary, insight_type=insight_type)
         session.close()
-        
-        logger.info(f"✓ Generated {insight_type} insights")
-        
-        return jsonify({
-            'success': True,
-            'insight_type': insight_type,
-            'photos_analyzed': len(photo_dicts),
-            'summary': summary,
-            'insights': insights
-        })
-        
+        return jsonify({'success': True, 'insight_type': insight_type, 'photos_analyzed': len(photo_dicts), 'summary': summary, 'insights': insights})
     except Exception as e:
         logger.error(f"Insights generation error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/llm/status', methods=['GET'])
 def llm_status():
-    """Check LLM service status"""
     try:
         llm_service = get_llm_service()
-        model_info = llm_service.get_model_info()
-        
-        return jsonify({
-            'success': True,
-            'model': llm_service.model,
-            'base_url': llm_service.base_url,
-            'model_info': model_info
-        })
-        
+        model_info  = llm_service.get_model_info()
+        return jsonify({'success': True, 'model': llm_service.model, 'base_url': llm_service.base_url, 'model_info': model_info})
     except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-# ============================================================================
-# Example: Complete chat workflow
-# ============================================================================
-"""
-USAGE EXAMPLE:
-
-1. Start new conversation:
-POST /api/conversation/new
-Response: {"conversation_id": "conv_abc123"}
-
-2. Send message:
-POST /api/chat
-{
-    "message": "Show me happy beach photos with Mom",
-    "conversation_id": "conv_abc123",
-    "top_k": 5
-}
-
-Response:
-{
-    "response": "I found 5 happy beach photos with Mom. In Photo 1...",
-    "retrieved_photos": [...],
-    "validation": {
-        "is_grounded": true,
-        "confidence": 0.95
-    }
-}
-
-3. Continue conversation:
-POST /api/chat
-{
-    "message": "When were these taken?",
-    "conversation_id": "conv_abc123"
-}
-// LLM has context from previous exchange
-
-4. Streaming chat:
-POST /api/chat/stream
-{
-    "message": "Tell me about my summer photos",
-    "conversation_id": "conv_abc123"
-}
-// Returns SSE stream of tokens
-
-5. Get insights:
-POST /api/insights
-{
-    "insight_type": "emotional"
-}
-
-Response:
-{
-    "insights": "You appear happiest in beach photos (78% happy vs 45% overall)..."
-}
-
-6. Get conversation history:
-GET /api/conversation/conv_abc123
-
-7. List all conversations:
-GET /api/conversations?limit=10
-"""
-
-# ============================================================================
-# MEMORY & CONVERSATION ENHANCEMENTS
-# ============================================================================
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/chat/enhanced', methods=['POST'])
 def enhanced_chat():
-    """
-    Enhanced chat with memory features
-    
-    Phase 5: Includes relevant memories from past conversations
-    
-    Request body:
-        {
-            "message": "Show me beach photos",
-            "conversation_id": "conv_123",
-            "use_memory": true,
-            "top_k": 5
-        }
-    """
     if not SERVICES_AVAILABLE:
         return jsonify({'error': 'Services not available'}), 500
-    
     try:
-        data = request.json
-        message = data.get('message', '')
-        conversation_id = data.get('conversation_id')
-        use_memory = data.get('use_memory', True)
-        top_k = data.get('top_k', 5)
-        
+        data             = request.json
+        message          = data.get('message', '')
+        conversation_id  = data.get('conversation_id')
+        use_memory       = data.get('use_memory', True)
+        top_k            = data.get('top_k', 5)
         if not message:
             return jsonify({'error': 'Message is required'}), 400
-        
-        logger.info(f"=== ENHANCED CHAT REQUEST ===")
-        logger.info(f"Message: {message}")
-        logger.info(f"Use memory: {use_memory}")
-        
-        # Get services
-        query_service = get_query_service()
-        retrieval_service = get_retrieval_service()
-        context_service = get_context_service()
-        llm_service = get_llm_service()
+        query_service        = get_query_service()
+        retrieval_service    = get_retrieval_service()
+        context_service      = get_context_service()
+        llm_service          = get_llm_service()
         conversation_service = get_conversation_service()
-        memory_service = get_memory_service()
-        
-        session = Session()
-        
-        # Create conversation if needed
+        memory_service       = get_memory_service()
+        session              = Session()
         if not conversation_id:
             conversation_id = conversation_service.create_conversation(session)
-        
-        # Parse query
-        clusters = session.query(Cluster).all()
+        clusters     = session.query(Cluster).all()
         known_people = [c.name for c in clusters]
-        parser = get_query_parser(known_people)
+        parser         = get_query_parser(known_people)
         parsed_filters = parser.parse(message)
-        
-        # Generate query embedding
         query_embedding = query_service.encode_query(message)
-        
         if query_embedding is None:
             session.close()
             return jsonify({'error': 'Failed to encode query'}), 500
-        
-        # Retrieve photos
         db_filters = {k: v for k, v in parsed_filters.items() if k != 'raw_query'}
-        retrieved_photos = retrieval_service.hybrid_search(
-            query_embedding,
-            filters=db_filters,
-            top_k=top_k
-        )
-        
-        # Build photo context
-        photo_context = context_service.build_context(
-            retrieved_photos,
-            message,
-            include_system_prompt=False
-        )
-        
-        # PHASE 5: Add relevant memories ✨
-        memory_context = ""
-        relevant_memories = []
-        
+        if db_filters:
+            retrieved_photos = retrieval_service.hybrid_search(query_embedding, filters=db_filters, top_k=top_k)
+        else:
+            retrieved_photos = retrieval_service.semantic_search(query_embedding, top_k=top_k, min_similarity=0.25)
+        photo_context      = context_service.build_context(retrieved_photos, message, include_system_prompt=False)
+        memory_context     = ""
+        relevant_memories  = []
         if use_memory:
-            relevant_memories = memory_service.get_relevant_memories(
-                session,
-                message,
-                user_id="default_user",
-                limit=3
-            )
-            
+            relevant_memories = memory_service.get_relevant_memories(session, message, user_id="default_user", limit=3)
             if relevant_memories:
                 memory_context = memory_service.build_memory_context(relevant_memories)
-                logger.info(f"✓ Found {len(relevant_memories)} relevant memories")
-        
-        # Combine contexts
-        full_context = conversation_service.build_context_with_history(
-            session,
-            conversation_id,
-            message,
-            photo_context,
-            use_summary=True
-        )
-        
-        # Add memory context at the beginning
+        full_context = conversation_service.build_context_with_history(session, conversation_id, message, photo_context, use_summary=True)
         if memory_context:
             full_context = memory_context + "\n" + full_context
-        
-        # Save user message
         photo_ids = [p['photo_id'] for p in retrieved_photos]
-        conversation_service.add_message(
-            session,
-            conversation_id,
-            role='user',
-            content=message,
-            retrieved_photo_ids=photo_ids,
-            metadata={
-                'filters': parsed_filters,
-                'results_count': len(retrieved_photos),
-                'memories_used': len(relevant_memories)
-            }
-        )
-        
-        # Generate LLM response
-        response_text = llm_service.generate_response(
-            context=full_context,
-            query=message
-        )
-        
-        # Validate response
-        validation = llm_service.validate_response(response_text, full_context)
-        
-        # Save assistant message
-        conversation_service.add_message(
-            session,
-            conversation_id,
-            role='assistant',
-            content=response_text,
-            metadata={'validation': validation}
-        )
-        
-        # PHASE 5: Auto-summarize if needed ✨
-        summary = conversation_service.auto_summarize_if_needed(
-            session,
-            conversation_id,
-            llm_service
-        )
-        
+        conversation_service.add_message(session, conversation_id, role='user', content=message, retrieved_photo_ids=photo_ids, metadata={'filters': parsed_filters, 'results_count': len(retrieved_photos), 'memories_used': len(relevant_memories)})
+        response_text = llm_service.generate_response(context=full_context, query=message)
+        validation    = llm_service.validate_response(response_text, full_context)
+        conversation_service.add_message(session, conversation_id, role='assistant', content=response_text, metadata={'validation': validation})
+        summary = conversation_service.auto_summarize_if_needed(session, conversation_id, llm_service)
+        session.commit()
         session.close()
-        
-        return jsonify({
-            'success': True,
-            'conversation_id': conversation_id,
-            'response': response_text,
-            'retrieved_photos': retrieved_photos,
-            'relevant_memories': relevant_memories,
-            'validation': validation,
-            'summarized': summary is not None
-        })
-        
+        return jsonify({'success': True, 'conversation_id': conversation_id, 'response': response_text, 'retrieved_photos': retrieved_photos, 'relevant_memories': relevant_memories, 'validation': validation, 'summarized': summary is not None})
     except Exception as e:
         logger.error(f"Enhanced chat error: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
+        import traceback; logger.error(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
-
 
 @app.route('/api/conversation/<conversation_id>/summarize', methods=['POST'])
 def summarize_conversation(conversation_id):
-    """
-    Manually trigger conversation summarization
-    
-    Phase 5.3: Generate or update summary
-    """
     if not SERVICES_AVAILABLE:
         return jsonify({'error': 'Services not available'}), 500
-    
     try:
-        data = request.json or {}
-        recursive = data.get('recursive', True)
-        
-        session = Session()
+        data                 = request.json or {}
+        recursive            = data.get('recursive', True)
+        session              = Session()
         conversation_service = get_conversation_service()
-        llm_service = get_llm_service()
-        
-        summary = conversation_service.summarize_conversation(
-            session,
-            conversation_id,
-            llm_service,
-            recursive=recursive
-        )
-        
+        llm_service          = get_llm_service()
+        summary              = conversation_service.summarize_conversation(session, conversation_id, llm_service, recursive=recursive)
         session.close()
-        
-        return jsonify({
-            'success': True,
-            'conversation_id': conversation_id,
-            'summary': summary
-        })
-        
+        return jsonify({'success': True, 'conversation_id': conversation_id, 'summary': summary})
     except Exception as e:
         logger.error(f"Summarization error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/conversation/<conversation_id>/optimize', methods=['POST'])
 def optimize_conversation(conversation_id):
-    """
-    Optimize long conversation by compressing old messages
-    
-    Phase 5: Memory optimization
-    """
     if not SERVICES_AVAILABLE:
         return jsonify({'error': 'Services not available'}), 500
-    
     try:
-        data = request.json or {}
+        data            = request.json or {}
         target_messages = data.get('target_messages', 20)
-        
-        session = Session()
-        memory_service = get_memory_service()
-        llm_service = get_llm_service()
-        
-        result = memory_service.optimize_long_conversation(
-            session,
-            conversation_id,
-            llm_service,
-            target_messages=target_messages
-        )
-        
+        session         = Session()
+        memory_service  = get_memory_service()
+        llm_service     = get_llm_service()
+        result          = memory_service.optimize_long_conversation(session, conversation_id, llm_service, target_messages=target_messages)
         session.close()
-        
-        return jsonify({
-            'success': True,
-            **result
-        })
-        
+        return jsonify({'success': True, **result})
     except Exception as e:
         logger.error(f"Optimization error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/memory/topics', methods=['GET'])
 def get_topics():
-    """
-    Get frequently discussed topics
-    
-    Phase 5: Memory analytics
-    """
     try:
-        limit = request.args.get('limit', 10, type=int)
-        
-        session = Session()
+        limit          = request.args.get('limit', 10, type=int)
+        session        = Session()
         memory_service = get_memory_service()
-        
-        topics = memory_service.get_frequently_discussed_topics(
-            session,
-            limit=limit
-        )
-        
+        topics         = memory_service.get_frequently_discussed_topics(session, limit=limit)
         session.close()
-        
-        return jsonify({
-            'success': True,
-            'topics': topics
-        })
-        
+        return jsonify({'success': True, 'topics': topics})
     except Exception as e:
         logger.error(f"Topics error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/memory/timeline', methods=['GET'])
 def get_memory_timeline():
-    """
-    Get conversation timeline
-    
-    Phase 5: Memory visualization
-    """
     try:
-        days = request.args.get('days', 30, type=int)
-        
-        session = Session()
+        days           = request.args.get('days', 30, type=int)
+        session        = Session()
         memory_service = get_memory_service()
-        
-        timeline = memory_service.get_conversation_timeline(
-            session,
-            days=days
-        )
-        
+        timeline       = memory_service.get_conversation_timeline(session, days=days)
         session.close()
-        
-        return jsonify({
-            'success': True,
-            'timeline': timeline,
-            'days': days
-        })
-        
+        return jsonify({'success': True, 'timeline': timeline, 'days': days})
     except Exception as e:
         logger.error(f"Timeline error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/photo/<photo_id>/history', methods=['GET'])
 def get_photo_history(photo_id):
-    """
-    Get interaction history for a specific photo
-    
-    Phase 5: Photo-level memory
-    """
     try:
-        session = Session()
+        session        = Session()
         memory_service = get_memory_service()
-        
-        history = memory_service.get_photo_interaction_history(
-            session,
-            photo_id
-        )
-        
+        history        = memory_service.get_photo_interaction_history(session, photo_id)
         session.close()
-        
-        return jsonify({
-            'success': True,
-            'photo_id': photo_id,
-            'interactions': history,
-            'interaction_count': len(history)
-        })
-        
+        return jsonify({'success': True, 'photo_id': photo_id, 'interactions': history, 'interaction_count': len(history)})
     except Exception as e:
         logger.error(f"Photo history error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/conversations/search', methods=['POST'])
 def search_conversations():
-    """
-    Search conversations by content
-    
-    Phase 5: Memory search
-    """
     try:
-        data = request.json
-        query = data.get('query', '')
-        limit = data.get('limit', 10)
-        
+        data                 = request.json
+        query                = data.get('query', '')
+        limit                = data.get('limit', 10)
         if not query:
             return jsonify({'error': 'Query is required'}), 400
-        
-        session = Session()
+        session              = Session()
         conversation_service = get_conversation_service()
-        
-        results = conversation_service.search_conversations(
-            session,
-            query,
-            limit=limit
-        )
-        
+        results              = conversation_service.search_conversations(session, query, limit=limit)
         session.close()
-        
-        return jsonify({
-            'success': True,
-            'query': query,
-            'results': results,
-            'count': len(results)
-        })
-        
+        return jsonify({'success': True, 'query': query, 'results': results, 'count': len(results)})
     except Exception as e:
         logger.error(f"Search error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/api/conversation/<conversation_id>/export', methods=['GET'])
 def export_conversation(conversation_id):
-    """
-    Export conversation as JSON or markdown
-    
-    Phase 5: Data export
-    """
     try:
-        format_type = request.args.get('format', 'json')
-        
-        session = Session()
+        format_type          = request.args.get('format', 'json')
+        session              = Session()
         conversation_service = get_conversation_service()
-        
-        # Get conversation
         from models import Conversation
-        conversation = session.query(Conversation).filter_by(
-            conversation_id=conversation_id
-        ).first()
-        
+        conversation = session.query(Conversation).filter_by(conversation_id=conversation_id).first()
         if not conversation:
             session.close()
             return jsonify({'error': 'Conversation not found'}), 404
-        
-        # Get history
-        history = conversation_service.get_conversation_history(
-            session,
-            conversation_id
-        )
-        
+        history = conversation_service.get_conversation_history(session, conversation_id)
         session.close()
-        
         if format_type == 'markdown':
-            # Export as markdown
-            md_lines = [
-                f"# Conversation {conversation_id}",
-                f"Created: {datetime.fromtimestamp(conversation.created_at).strftime('%Y-%m-%d %H:%M')}",
-                f"Messages: {len(history)}",
-                ""
-            ]
-            
+            md_lines = [f"# Conversation {conversation_id}", f"Created: {datetime.fromtimestamp(conversation.created_at).strftime('%Y-%m-%d %H:%M')}", f"Messages: {len(history)}", ""]
             if conversation.summary:
-                md_lines.extend([
-                    "## Summary",
-                    conversation.summary,
-                    ""
-                ])
-            
-            md_lines.append("## Messages")
-            md_lines.append("")
-            
+                md_lines.extend(["## Summary", conversation.summary, ""])
+            md_lines.append("## Messages\n")
             for msg in history:
-                role = msg['role'].upper()
-                content = msg['content']
+                role      = msg['role'].upper()
+                content   = msg['content']
                 timestamp = datetime.fromtimestamp(msg['created_at']).strftime('%Y-%m-%d %H:%M')
-                
                 md_lines.append(f"### {role} ({timestamp})")
                 md_lines.append(content)
                 md_lines.append("")
-            
-            return Response(
-                '\n'.join(md_lines),
-                mimetype='text/markdown',
-                headers={'Content-Disposition': f'attachment; filename=conversation_{conversation_id}.md'}
-            )
-        
+            return Response('\n'.join(md_lines), mimetype='text/markdown', headers={'Content-Disposition': f'attachment; filename=conversation_{conversation_id}.md'})
         else:
-            # Export as JSON
-            export_data = {
-                'conversation_id': conversation_id,
-                'created_at': conversation.created_at,
-                'updated_at': conversation.updated_at,
-                'message_count': len(history),
-                'summary': conversation.summary,
-                'messages': history
-            }
-            
-            return jsonify(export_data)
-        
+            return jsonify({'conversation_id': conversation_id, 'created_at': conversation.created_at, 'updated_at': conversation.updated_at, 'message_count': len(history), 'summary': conversation.summary, 'messages': history})
     except Exception as e:
         logger.error(f"Export error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
 # ============================================================================
-# Example Usage
+# OBJECT CLUSTER ROUTES
 # ============================================================================
-"""
-PHASE 5 USAGE EXAMPLES:
 
-1. Enhanced chat with memory:
-POST /api/chat/enhanced
-{
-    "message": "Show me beach photos",
-    "conversation_id": "conv_123",
-    "use_memory": true
-}
+@app.route('/api/object-clusters', methods=['GET'])
+def get_object_clusters():
+    objects_only = request.args.get('objects_only', 'false').lower() == 'true'
+    session = Session()
+    try:
+        service  = get_object_cluster_service()
+        clusters = service.get_all_clusters(session, objects_only=objects_only)
+        return jsonify({'clusters': clusters, 'total': len(clusters)})
+    except Exception as e:
+        logger.error(f"Error fetching object clusters: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
 
-2. Manual summarization:
-POST /api/conversation/conv_123/summarize
-{
-    "recursive": true
-}
+@app.route('/api/object-clusters/<cluster_id>/photos', methods=['GET'])
+def get_object_cluster_photos(cluster_id):
+    objects_only = request.args.get('objects_only', 'false').lower() == 'true'
+    limit  = int(request.args.get('limit',  50))
+    offset = int(request.args.get('offset',  0))
+    session = Session()
+    try:
+        service = get_object_cluster_service()
+        photos  = service.get_photos_in_cluster(session, cluster_id, objects_only=objects_only, limit=limit, offset=offset)
+        return jsonify({'photos': photos, 'cluster_id': cluster_id})
+    except Exception as e:
+        logger.error(f"Error fetching cluster photos: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
 
-3. Optimize long conversation:
-POST /api/conversation/conv_123/optimize
-{
-    "target_messages": 20
-}
-
-4. Get frequently discussed topics:
-GET /api/memory/topics?limit=10
-
-5. Get conversation timeline:
-GET /api/memory/timeline?days=30
-
-6. Get photo interaction history:
-GET /api/photo/photo_123/history
-
-7. Search conversations:
-POST /api/conversations/search
-{
-    "query": "beach vacation",
-    "limit": 10
-}
-
-8. Export conversation:
-GET /api/conversation/conv_123/export?format=markdown
-"""
-
+@app.route('/api/object-clusters/rebuild', methods=['POST'])
+def rebuild_object_clusters():
+    session = Session()
+    try:
+        service  = get_object_cluster_service()
+        service.rebuild_all_clusters(session)
+        clusters = service.get_all_clusters(session)
+        return jsonify({'message': 'Rebuild complete', 'cluster_count': len(clusters)})
+    except Exception as e:
+        logger.error(f"Rebuild error: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
 
 # ============================================================================
 # MAIN
@@ -2231,5 +1320,4 @@ if __name__ == '__main__':
     logger.info(f"   Upload folder: {UPLOAD_FOLDER}")
     logger.info(f"   Services: {'✓ Available' if SERVICES_AVAILABLE else '✗ Not Available'}")
     logger.info("="*60 + "\n")
-    
     app.run(debug=True, port=5002, host='0.0.0.0')
